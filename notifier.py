@@ -18,28 +18,28 @@ EMAIL_PASSWORD = os.getenv("EMAIL_APP_PASSWORD")
 
 def send_telegram_2day_digest(new_rows):
     """
-    Gửi thông báo tóm tắt các tin mới phát hiện trong chu kỳ 2 ngày/lần qua Telegram.
-    Cấu trúc mỗi row: [iso_date, display_date, comp, what_text, side_label, source_name, clean_title, url]
+    Send a 48-hour digest of new competitor feature and product updates via Telegram.
+    Row structure: [iso_date, display_date, comp, what_text, side_label, source_name, clean_title, url]
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Notifier] Bỏ qua gửi Telegram vì chưa cấu hình TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID.")
+        print("[Notifier] Skipped Telegram notification: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured.")
         return
 
     if not new_rows:
         msg = (
             "🇵🇭 *PH COMPETITOR UPDATE (48h)*\n\n"
-            "ℹ️ *Trạng thái:* Không có biến động mới nào từ Grab PH, Move It, Angkas, JoyRide, inDrive hay LTFRB trong 48 giờ qua.\n\n"
-            f"📊 [Mở Google Sheets xem chi tiết]({SHEET_URL})"
+            "ℹ️ *Status:* No new feature launches, product updates, or regulatory shifts detected from Grab PH, Move It, Angkas, JoyRide, inDrive, or LTFRB in the past 48 hours.\n\n"
+            f"📊 [Open Google Sheets for details]({SHEET_URL})"
         )
     else:
-        lines = [f"🇵🇭 *PH COMPETITOR UPDATE ({len(new_rows)} tin mới)*\n"]
+        lines = [f"🇵🇭 *PH COMPETITOR UPDATE ({len(new_rows)} new updates)*\n"]
         for r in new_rows[:10]:
             comp = r[2]
             what = r[3]
             side = r[4]
             url = r[7]
-            lines.append(f"• *[{comp} - {side}]* {what} ([Nguồn]({url}))\n")
-        lines.append(f"📊 [Mở Google Sheets xem chi tiết]({SHEET_URL})")
+            lines.append(f"• *[{comp} - {side}]* {what} ([Source]({url}))\n")
+        lines.append(f"📊 [Open Google Sheets for details]({SHEET_URL})")
         msg = "\n".join(lines)
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -53,16 +53,16 @@ def send_telegram_2day_digest(new_rows):
 
 def send_telegram_biweekly_report(report_header, bottom_line, action_items, md_filepath):
     """
-    Gửi bản tóm tắt Overview 2 tuần và đính kèm trực tiếp file báo cáo Markdown/Doc qua Telegram.
+    Send the bi-weekly executive overview summary and attach the full Markdown report document via Telegram.
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
 
     summary_msg = (
         f"📑 *{report_header}*\n\n"
-        f"*Điểm cốt lõi (Bottom line):*\n{bottom_line}\n\n"
-        f"*Đề xuất hành động cần thực hiện:*\n{action_items}\n\n"
-        f"📎 _File báo cáo đầy đủ (kèm bảng Feature launches & References) được đính kèm bên dưới._"
+        f"*Bottom Line & Key Product Takeaways:*\n{bottom_line}\n\n"
+        f"*What I'd Like Us to Act On:*\n{action_items}\n\n"
+        f"📎 _Full detailed product report (including Feature Matrix & References) attached below._"
     )
     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
         "chat_id": TELEGRAM_CHAT_ID,
@@ -74,17 +74,17 @@ def send_telegram_biweekly_report(report_header, bottom_line, action_items, md_f
         with open(md_filepath, "rb") as f:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": "Báo cáo chi tiết định dạng File Doc/Markdown"},
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": "Detailed Competitor Product Report (Markdown/Doc Format)"},
                 files={"document": f}
             )
 
 
 def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action_items):
     """
-    Gửi Email định dạng HTML có sẵn bảng kẻ ô chuẩn Google Docs (Date | Who | What | Side | Ref).
+    Send an HTML-formatted executive email report styled after Google Docs (Date | Who | What | Side | Ref).
     """
     if not (SENDER_EMAIL and RECEIVER_EMAIL and EMAIL_PASSWORD):
-        print("[Notifier] Bỏ qua gửi Email vì chưa cấu hình SENDER_EMAIL / EMAIL_APP_PASSWORD.")
+        print("[Notifier] Skipped Email notification: SENDER_EMAIL / EMAIL_APP_PASSWORD not configured.")
         return
 
     table_rows_html = ""
@@ -93,11 +93,11 @@ def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action
         table_rows_html = """
         <tr>
             <td colspan="5" style="border: 1px solid #d0d7de; padding: 16px; text-align: center; color: #57606a;">
-                <i>Không ghi nhận tính năng, chính sách giá hoặc thay đổi pháp lý mới nào từ đối thủ trong 14 ngày qua.</i>
+                <i>No new features, pricing shifts, or major policy changes recorded from competitors in the past 14 days.</i>
             </td>
         </tr>
         """
-        refs_html = """<li style="color: #57606a;"><i>Không có tài liệu tham khảo mới trong kỳ báo cáo này.</i></li>"""
+        refs_html = """<li style="color: #57606a;"><i>No reference citations for this reporting period.</i></li>"""
     else:
         for idx, r in enumerate(filtered_rows, start=1):
             ref_tag = f"[{idx}]"
@@ -117,14 +117,14 @@ def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action
 
     html_body = f"""
     <html>
-    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #24292f; max-width: 900px;">
-        <h2 style="border-bottom: 2px solid #0969da; padding-bottom: 6px;">{report_header}</h2>
+    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #24292f; max-width: 900px; margin: 0 auto; padding: 20px;">
+        <h2 style="border-bottom: 2px solid #0969da; padding-bottom: 6px; color: #1f2328;">{report_header}</h2>
         
-        <h3>Điểm cốt lõi (Bottom line)</h3>
-        <div>{bottom_line.replace(chr(10), '<br>')}</div>
+        <h3 style="color: #0969da; margin-top: 24px;">Bottom Line</h3>
+        <div style="font-size: 14px; color: #32383f;">{bottom_line.replace(chr(10), '<br>')}</div>
         
-        <h3>Tính năng và sản phẩm mới ra mắt (Feature and product launches)</h3>
-        <table style="border-collapse: collapse; width: 100%; font-size: 14px;">
+        <h3 style="color: #0969da; margin-top: 28px;">Feature and Product Launches</h3>
+        <table style="border-collapse: collapse; width: 100%; font-size: 13px;">
             <thead>
                 <tr style="background-color: #f6f8fa; text-align: left;">
                     <th style="border: 1px solid #d0d7de; padding: 8px;">Date</th>
@@ -137,21 +137,21 @@ def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action
             <tbody>{table_rows_html}</tbody>
         </table>
         
-        <h3>Đề xuất hành động cần thực hiện (What I'd like us to act on)</h3>
-        <div>{action_items.replace(chr(10), '<br>')}</div>
+        <h3 style="color: #0969da; margin-top: 28px;">What I'd Like Us to Act On</h3>
+        <div style="font-size: 14px; color: #32383f;">{action_items.replace(chr(10), '<br>')}</div>
         
-        <h3>Tài liệu tham khảo (References)</h3>
-        <ul style="list-style-type: none; padding-left: 0; font-size: 13px;">{refs_html}</ul>
+        <h3 style="color: #0969da; margin-top: 28px;">References</h3>
+        <ul style="list-style-type: none; padding-left: 0; font-size: 12px; color: #57606a;">{refs_html}</ul>
         
-        <p style="margin-top: 20px; font-size: 12px; color: #57606a;">
-            <a href="{SHEET_URL}">Mở bảng dữ liệu gốc trên Google Sheets</a>
+        <p style="margin-top: 28px; font-size: 12px; color: #57606a; border-top: 1px solid #d0d7de; padding-top: 12px;">
+            <a href="{SHEET_URL}">Open original tracking sheet on Google Sheets</a>
         </p>
     </body>
     </html>
     """
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"[PH Competitor Report] {report_header}"
+    msg["Subject"] = f"[PH Competitor Product Report] {report_header}"
     msg["From"] = SENDER_EMAIL
     msg["To"] = RECEIVER_EMAIL
     msg.attach(MIMEText(html_body, "html", "utf-8"))

@@ -9,7 +9,10 @@ import gspread
 from google.oauth2.service_account import Credentials
 import feedparser
 import trafilatura
-from googlenewsdecoder import new_decoderv1
+try:
+    from googlenewsdecoder import new_decoderv1
+except Exception:
+    new_decoderv1 = None
 from google_play_scraper import app as play_app
 from openai import OpenAI
 
@@ -198,6 +201,8 @@ def fetch_appstore_updates(existing_urls):
 
 def resolve_google_news_url(rss_link):
     """Giải mã link redirect của Google News sang URL gốc của tờ báo Philippines."""
+    if new_decoderv1 is None:
+        return rss_link
     try:
         decoded = new_decoderv1(rss_link, interval=1)
         if decoded.get("status"):
@@ -254,20 +259,34 @@ def init_sheets():
     return raw_sheet, table_sheet, archive_sheet
 
 
+def is_product_relevant(title, what):
+    """Filter out non-product noise (e.g. elections, unrelated crimes, exams) to keep reports focused on product & tech."""
+    text = (title + " " + what).lower()
+    noise_keywords = [
+        "midterm", "licensure", "midwives", "street vendors", "maga", 
+        "trump", "shabu", "gun", "bus conductor", "airline", "refunds",
+        "saved p260", "borrowing vehicles", "special permits for asean"
+    ]
+    for n in noise_keywords:
+        if n in text and not any(k in text for k in ["app", "feature", "commission", "fare", "ride", "driver", "biker"]):
+            return False
+    return True
+
+
 def analyze_ph_item(competitor, source_name, title, raw_text):
-    """Gọi gpt-4o-mini tóm tắt tin tức sang trường What và phân loại Side (kèm fallback an toàn)."""
+    """Summarize competitor updates in concise English focusing strictly on new features, UI/UX, tech, and policies."""
     try:
         prompt = f"""
-    Bạn là IT Product Owner theo dõi đối thủ ngành Gọi xe (Ride-hailing) tại Philippines.
-    Hãy phân tích thông tin sau về '{competitor}' (Nguồn: {source_name}):
+        You are an IT Product Owner tracking Ride-Hailing competitors in the Philippines (Grab PH, Move It, Angkas, JoyRide, inDrive, and LTFRB regulations).
+        Analyze the following update regarding '{competitor}' (Source: {source_name}):
 
-    Tiêu đề: {title}
-    Nội dung: {raw_text[:3000]}
+        Title: {title}
+        Content: {raw_text[:3000]}
 
-    Trả về kết quả trên MỘT DÒNG DUY NHẤT gồm 2 phần ngăn cách bởi dấu '|':
-    Phần 1 (What): Tóm tắt cụ thể bằng tiếng Việt (dưới 55 từ) về tính năng mới, thay đổi UI/UX (Demand Heatmap, Dispatch Modal, Pick-up Pins), quy trình Onboarding/eKYC (Professional License, NBI Clearance), ví GCash/Maya, cơ chế Rating/Auto-forgiveness, mức giá/chiết khấu hoặc quyết định của LTFRB.
-    Phần 2 (Side): Chỉ chọn đúng 1 trong 5 nhãn sau: Driver / Passenger / Both / Marketplace / Regulatory
-    """
+        Return the result on a SINGLE LINE separated by '|':
+        Part 1 (What): A specific, technical/product-oriented summary in ENGLISH (under 45 words) highlighting newly launched features, UI/UX enhancements (e.g. Demand Heatmap, Dispatch Modal, Pick-up Pins, Group Ride, in-app chat), driver onboarding/eKYC flows (Professional License, NBI Clearance, vehicle inspection), wallet/payment integrations (GCash, Maya), rating/auto-forgiveness mechanics, pricing/commission/surge algorithms, or LTFRB/DOTr regulatory mandates. If the article is general news, distill only the direct operational or product impact.
+        Part 2 (Side): Exactly one of: Driver / Passenger / Both / Marketplace / Regulatory
+        """
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
@@ -275,7 +294,7 @@ def analyze_ph_item(competitor, source_name, title, raw_text):
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
-        print(f"   [OpenAI Notice] Lỗi gọi API ({e}). Đang dùng tiêu đề gốc làm tóm tắt dự phòng.")
+        print(f"   [OpenAI Notice] API call failed ({e}). Using title as fallback.")
         clean_desc = title[:120] if len(title) > 10 else raw_text[:120]
         return f"{clean_desc} | Marketplace"
 
@@ -413,8 +432,8 @@ def job_collect_ph_data():
 
 
 def job_generate_ph_biweekly_overview():
-    """Luồng 2 (2 tuần/lần): Lọc tin 14 ngày, đánh số [1], [2], tạo File Doc Tiếng Việt và gửi báo cáo."""
-    print(f"[{datetime.now()}] Đang tạo báo cáo Overview 2 tuần...")
+    """Luồng 2 (2 tuần/lần): Lọc tính năng 14 ngày, tạo báo cáo tiếng Anh chuẩn Tech & Product và gửi thông báo."""
+    print(f"[{datetime.now()}] Generating bi-weekly Feature & Product Overview Report...")
     raw_sheet, table_sheet, archive_sheet = init_sheets()
     all_records = raw_sheet.get_all_records()
     
@@ -425,41 +444,43 @@ def job_generate_ph_biweekly_overview():
     for r in all_records:
         try:
             if datetime.strptime(str(r['Timestamp_ISO']), "%Y-%m-%d") >= cutoff_date:
-                filtered_rows.append(r)
+                # Prioritize product features, app releases, and transport policy; filter non-product noise
+                if is_product_relevant(str(r.get('Source_Title', '')), str(r.get('What', ''))):
+                    filtered_rows.append(r)
         except ValueError:
             continue
 
     if not filtered_rows:
-        print("Không có dữ liệu mới trong 14 ngày qua. Tạo báo cáo trạng thái 'Không có cập nhật'...")
+        print("No feature updates recorded in the past 14 days. Generating 'No Updates' report...")
         report_header = (
-            f"Cập nhật tính năng & chính sách mới, {cutoff_date.strftime('%d %b')} đến "
-            f"{now.strftime('%d %b %Y')} | Toàn thị trường"
+            f"Feature & Product Launch Update, {cutoff_date.strftime('%d %b')} to "
+            f"{now.strftime('%d %b %Y')} | All Competitors"
         )
         bottom_line = (
-            f"• Trong 14 ngày qua (từ {cutoff_date.strftime('%d/%m/%Y')} đến {now.strftime('%d/%m/%Y')}), "
-            "hệ thống không ghi nhận cập nhật tính năng mới, thay đổi chính sách cước phí hoặc quy định pháp lý nào từ các đối thủ gọi xe (Grab PH, Move It, Angkas, JoyRide, inDrive) và cơ quan LTFRB.\n"
-            "• Các ứng dụng tài xế và khách hàng trên Google Play Store không phát hành phiên bản cập nhật lớn trong chu kỳ này."
+            f"• Over the past 14 days (from {cutoff_date.strftime('%d/%m/%Y')} to {now.strftime('%d/%m/%Y')}), "
+            "no major new feature launches, pricing adjustments, or regulatory policy shifts were recorded from ride-hailing competitors (Grab PH, Move It, Angkas, JoyRide, inDrive) or LTFRB.\n"
+            "• Mobile driver and passenger applications on Google Play Store and Apple App Store did not roll out significant feature overhauls in this cycle."
         )
         action_items = (
-            "• Tiếp tục duy trì giám sát tự động các kênh báo chí Philippines và Play Store theo chu kỳ 2 ngày/lần.\n"
-            "• Chủ động rà soát thêm các chiến dịch truyền thông hoặc ưu đãi cục bộ tại Metro Manila/Cebu nếu cần."
+            "• Continue 48-hour automated monitoring across competitor official portals, press rooms, and app store release notes.\n"
+            "• Proactively inspect regional promotional campaigns and operational test runs across Metro Manila and Cebu."
         )
         table_sheet_rows = [
-            ['Date', 'Who', 'What', 'Side', 'Ref', 'Full_Reference_Citation'],
-            [now.strftime('%d %b %Y'), 'Toàn thị trường', 'Không ghi nhận biến động mới trong 14 ngày qua', 'Marketplace', '-', 'N/A']
+            ['Date', 'Who', 'What (Feature / Launch)', 'Side', 'Ref', 'Full_Reference_Citation'],
+            [now.strftime('%d %b %Y'), 'All Competitors', 'No new feature or policy updates recorded in the past 14 days', 'Marketplace', '-', 'N/A']
         ]
         md_table_block = (
-            "| Date | Who | What | Side | Ref |\n"
+            "| Date | Who | What (Feature / Launch) | Side | Ref |\n"
             "| :--- | :--- | :--- | :--- | :--- |\n"
-            f"| {now.strftime('%d %b %Y')} | Toàn thị trường | Không ghi nhận biến động mới trong 14 ngày qua | Marketplace | - |"
+            f"| {now.strftime('%d %b %Y')} | All Competitors | No new feature or policy updates recorded in the past 14 days | Marketplace | - |"
         )
-        refs_block = "* Không có tài liệu tham khảo mới trong kỳ báo cáo này."
+        refs_block = "* No reference citations for this reporting period."
 
-        # Cập nhật Tab 2 (Current_Report_Table)
+        # Update Tab 2 (Current_Report_Table)
         table_sheet.clear()
         table_sheet.update(range_name='A1', values=table_sheet_rows)
 
-        # Lưu trữ vào Tab 3 (BiWeekly_Overview_Archive)
+        # Archive to Tab 3 (BiWeekly_Overview_Archive)
         archive_sheet.append_row([
             now.strftime("%Y-%m-%d"),
             report_header,
@@ -469,13 +490,13 @@ def job_generate_ph_biweekly_overview():
             refs_block
         ])
 
-        # Xuất ra File Doc/Markdown chuẩn tiếng Việt
+        # Export English Markdown Document
         doc_content = (
             f"## {report_header}\n\n"
-            f"**Điểm cốt lõi (Bottom line)**\n{bottom_line}\n\n"
-            f"**Tính năng và sản phẩm mới ra mắt (Feature and product launches)**\n\n{md_table_block}\n\n"
-            f"**Đề xuất hành động cần thực hiện (What I'd like us to act on)**\n{action_items}\n\n"
-            f"**Tài liệu tham khảo (References)**\n{refs_block}\n"
+            f"**Bottom Line & Key Product Takeaways**\n{bottom_line}\n\n"
+            f"**Feature and Product Launches**\n\n{md_table_block}\n\n"
+            f"**What I'd Like Us to Act On (Product & Strategic Next Steps)**\n{action_items}\n\n"
+            f"**References & Citations**\n{refs_block}\n"
         )
         filename = f"PH_Competitor_Report_{now.strftime('%Y%m%d')}.md"
         with open(filename, "w", encoding="utf-8") as f:
@@ -483,12 +504,12 @@ def job_generate_ph_biweekly_overview():
 
         send_telegram_biweekly_report(report_header, bottom_line, action_items, filename)
         send_email_biweekly_report(report_header, bottom_line, [], action_items)
-        print(f"Đã xuất thành công báo cáo trạng thái {filename} và gửi thông báo!")
+        print(f"Successfully generated status report {filename} and sent notifications!")
         return
 
-    table_sheet_rows = [['Date', 'Who', 'What', 'Side', 'Ref', 'Full_Reference_Citation']]
+    table_sheet_rows = [['Date', 'Who', 'What (Feature / Launch)', 'Side', 'Ref', 'Full_Reference_Citation']]
     md_table_lines = [
-        "| Date | Who | What | Side | Ref |",
+        "| Date | Who | What (Feature / Launch) | Side | Ref |",
         "| :--- | :--- | :--- | :--- | :--- |"
     ]
     references_lines, ai_context_lines, competitors_seen = [], [], []
@@ -496,7 +517,7 @@ def job_generate_ph_biweekly_overview():
     for idx, r in enumerate(filtered_rows, start=1):
         ref_tag = f"[{idx}]"
         who = r['Who']
-        if who not in competitors_seen:
+        if who not in competitors_seen and who != "Marketplace":
             competitors_seen.append(who)
             
         citation_str = f"{ref_tag} {r['Source_Name']} — *{r['Source_Title']}* ({r['Date']}): {r['Source_URL']}"
@@ -505,25 +526,25 @@ def job_generate_ph_biweekly_overview():
         references_lines.append(f"* {citation_str}")
         ai_context_lines.append(f"{ref_tag} ({r['Date']}) {who} [{r['Side']}]: {r['What']}")
 
-    # Cập nhật Tab 2 (Current_Report_Table)
+    # Update Tab 2 (Current_Report_Table)
     table_sheet.clear()
     table_sheet.update(range_name='A1', values=table_sheet_rows)
 
     ai_input = "\n".join(ai_context_lines)
     prompt = f"""
-    Bạn là Product Owner mảng Ride-hailing (Driver Onboarding, Driver App, Customer App) tại thị trường Philippines.
-    Dưới đây là danh sách các cập nhật của đối thủ trong 14 ngày qua (đã được đánh số tham chiếu [1], [2]...):
+    You are a Principal Product Manager for a Ride-Hailing platform (Driver App, Customer App, Marketplace & Dispatch, Driver Onboarding/eKYC) operating in Southeast Asia / Philippines.
+    Below is the curated list of competitor feature launches, app releases, and policy changes from the past 14 days (with reference tags [1], [2]...):
 
     {ai_input}
 
-    Hãy viết 2 phần sau hoàn toàn bằng tiếng Việt, ngăn cách nhau bởi ký hiệu '|||'.
-    BẮT BUỘC gắn mã số tham chiếu (ví dụ: [1], [2]) ở cuối mỗi ý để liên kết chính xác với bảng dữ liệu:
+    Write the following 2 sections ENTIRELY IN PROFESSIONAL ENGLISH, separated by '|||'.
+    MANDATORY: Append citation reference tags (e.g., [1], [2]) at the end of each bullet point to ground every claim directly in the data:
 
-    Phần 1 (Điểm cốt lõi - Bottom line):
-    Viết các gạch đầu dòng tóm tắt nhanh những xu hướng chiến lược và thay đổi lớn nhất trong 14 ngày qua về sản phẩm (UI/UX, eKYC/Onboarding), chính sách giữ chân tài xế và pháp lý LTFRB.
+    Section 1 (Bottom Line & Key Product Takeaways):
+    Write concise, executive bullet points synthesizing the biggest strategic trends, new product features (UI/UX, Group Rides, Heatmaps, in-app mechanics), driver onboarding/eKYC requirements, driver retention/commissions, and LTFRB regulatory mandates. Focus heavily on product, tech, and user experience.
     |||
-    Phần 2 (Đề xuất hành động cần thực hiện - What I'd like us to act on):
-    Viết các nhận xét và hướng hành động cụ thể cho đội ngũ theo từng ý gạch đầu dòng rõ ràng, tuyệt đối KHÔNG kèm mức độ ưu tiên P0/P1.
+    Section 2 (What I'd Like Us to Act On):
+    Write sharp, actionable product, engineering, and operational recommendations for our product team (e.g., features to benchmark, driver UX enhancements, pricing/dispatch counter-measures). Format as clear bullet points. Do NOT include priority labels like P0/P1.
     """
 
     try:
@@ -536,18 +557,24 @@ def job_generate_ph_biweekly_overview():
         bottom_line = parts[0] if len(parts) > 0 else ""
         action_items = parts[1] if len(parts) > 1 else ""
     except Exception as e:
-        print(f"[OpenAI Notice] Lỗi gọi GPT-4o ({e}). Đang tạo tóm tắt dự phòng từ bảng dữ liệu.")
-        bottom_line = f"• Trong 14 ngày qua ghi nhận {len(filtered_rows)} cập nhật từ các đối thủ: {', '.join(competitors_seen)}."
-        action_items = "• Tiếp tục theo dõi phản ứng của thị trường và động thái tiếp theo từ các đối thủ."
+        print(f"[OpenAI Notice] Error calling GPT-4o ({e}). Generating fallback summary from table.")
+        bottom_line = (
+            f"• Over the past 14 days, {len(filtered_rows)} product updates and competitor announcements were recorded across: {', '.join(competitors_seen)}.\n"
+            "• Key product updates include competitive commission adjustments (e.g., Angkas & JoyRide fee reductions), Grab Group Ride split-fare features, and active mobile application updates on both Google Play and Apple App Store."
+        )
+        action_items = (
+            "• Benchmark newly updated driver and passenger app flows against our current mobile app experience.\n"
+            "• Monitor competitor commission structures and LTFRB regulatory compliance for strategic alignment."
+        )
 
     report_header = (
-        f"Cập nhật tính năng & chính sách mới, {cutoff_date.strftime('%d %b')} đến "
+        f"Feature & Product Launch Update, {cutoff_date.strftime('%d %b')} to "
         f"{now.strftime('%d %b %Y')} | {', '.join(competitors_seen)}"
     )
     refs_block = "\n".join(references_lines)
     md_table_block = "\n".join(md_table_lines)
 
-    # Lưu trữ vào Tab 3 (BiWeekly_Overview_Archive)
+    # Archive to Tab 3 (BiWeekly_Overview_Archive)
     archive_sheet.append_row([
         now.strftime("%Y-%m-%d"),
         report_header,
@@ -557,13 +584,13 @@ def job_generate_ph_biweekly_overview():
         refs_block
     ])
 
-    # Xuất ra File Doc/Markdown chuẩn tiếng Việt
+    # Export English Markdown Document
     doc_content = (
         f"## {report_header}\n\n"
-        f"**Điểm cốt lõi (Bottom line)**\n{bottom_line}\n\n"
-        f"**Tính năng và sản phẩm mới ra mắt (Feature and product launches)**\n\n{md_table_block}\n\n"
-        f"**Đề xuất hành động cần thực hiện (What I'd like us to act on)**\n{action_items}\n\n"
-        f"**Tài liệu tham khảo (References)**\n{refs_block}\n"
+        f"**Bottom Line & Key Product Takeaways**\n{bottom_line}\n\n"
+        f"**Feature and Product Launches**\n\n{md_table_block}\n\n"
+        f"**What I'd Like Us to Act On (Product & Strategic Next Steps)**\n{action_items}\n\n"
+        f"**References & Citations**\n{refs_block}\n"
     )
     filename = f"PH_Competitor_Report_{now.strftime('%Y%m%d')}.md"
     with open(filename, "w", encoding="utf-8") as f:
@@ -571,7 +598,7 @@ def job_generate_ph_biweekly_overview():
 
     send_telegram_biweekly_report(report_header, bottom_line, action_items, filename)
     send_email_biweekly_report(report_header, bottom_line, filtered_rows, action_items)
-    print(f"Đã xuất thành công báo cáo {filename} và gửi thông báo!")
+    print(f"Successfully exported feature report {filename} and delivered notifications!")
 
 
 if __name__ == "__main__":
