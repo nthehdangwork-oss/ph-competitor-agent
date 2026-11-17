@@ -282,59 +282,98 @@ def guess_side(text):
 
 
 def is_product_relevant(title, what, who=""):
-    """Filter out non-product noise (e.g. general crime, sports, entertainment, unrelated politics) 
-    to keep reports strictly focused on product, tech, features, and transport operations."""
+    """STRICT filter: only retain articles about new features, product launches, app releases,
+    UI/UX changes, pricing/commission changes, driver/passenger program launches, 
+    and significant LTFRB policy directly impacting platform operations.
+    Excludes: crime/harassment incidents, court/legal drama, social welfare, general news profiles, 
+    sports, entertainment, static homepage content, and PR fluff."""
     text = (title + " " + what).lower()
-    
-    # Must belong to target domain or target competitors
-    valid_competitors = ["grab ph", "move it", "angkas", "joyride ph", "indrive ph", "ltfrb", "dotr"]
-    if who and who.lower() not in valid_competitors:
-        # If categorized as Marketplace or unknown, only allow if strictly mentions ride-hailing/TNVS
-        if not any(k in text for k in ["ride-hailing", "tnvs", "motorcycle taxi", "mc taxi", "grab", "angkas", "joyride", "move it", "indrive"]):
-            return False
 
-    # Negative keyword filter (entertainment, sports, random crimes, lifestyle, general politics)
-    noise_keywords = [
-        "nba", "basketball", "gilas", "fiba", "family feud", "episode", "concert", "celebrity",
-        "showbiz", "scoop opens", "rockwell", "shabu", "gun", "nabbed", "arrested for drugs",
-        "maria ressa", "asean summit vehicles", "pitx for long weekend", "midterm", "licensure",
-        "midwives", "street vendors", "maga", "trump", "airline", "refunds", "saved p260",
-        "borrowing vehicles", "hotel", "resort", "fashion", "pageant", "beauty queen", "miss universe"
+    # ── HARD EXCLUSIONS (always discard) ──────────────────────────────────────────
+    hard_noise = [
+        # crime / incidents
+        "shabu", "nabbed", "arrested", "gun", "drugs", "drug", "robbery", "killed", "killed by",
+        "murder", "rape", "harassment complaint", "alleged", "altercation", "provocation",
+        "disrespect", "summoned over", "viral video", "confrontation", "misconduct",
+        # legal proceedings (not operational)
+        "file abuse", "file raps", "file charges", "rape charges", "complaints filed",
+        # social / welfare fluff
+        "cum laude", "graduates", "scholar program", "scholarship", "first-timer's guide",
+        "deaf woman", "deaf passenger", "palm sunday", "christmas", "new year",
+        # entertainment / sports
+        "nba", "basketball", "gilas", "fiba", "family feud", "episode", "concert", 
+        "celebrity", "showbiz", "miss universe", "pageant", "fashion",
+        # unrelated brands / events
+        "asean summit", "pitx for long weekend", "rockwell", "hotel", "resort",
+        "maga", "trump", "midterm", "licensure", "midwives", "street vendors",
+        # vague static pages with no actionable product info
+        "privacy preference center", "passenger appeal form", "download the official",
+        "grab. the everyday everything", "joyride ph: mc taxi, car, airport",
+        "indrive services in philippines | offer your fare",
     ]
-    for n in noise_keywords:
+    for n in hard_noise:
         if n in text:
             return False
 
-    # Positive confirmation: must mention mobility, app features, policy, or competitors
-    core_signals = [
-        "app", "feature", "version", "release", "update", "launch", "driver", "rider", "biker",
-        "passenger", "fare", "fee", "commission", "surge", "discount", "promo", "voucher",
-        "payment", "wallet", "gcash", "maya", "onboarding", "ekyc", "license", "inspection",
-        "dispatch", "safety", "sos", "tracking", "map", "pin", "group ride", "pilot",
-        "tnvs", "motorcycle taxi", "mc taxi", "ltfrb", "dotr", "cap", "quota", "hearing", "fine",
-        "penalty", "expansion", "superapp", "cash loan", "incentive", "appeal", "franchise"
+    # ── POSITIVE SIGNALS (must have at least ONE) ──────────────────────────────────
+    # Only pass articles that contain clear product / feature / platform signals
+    product_signals = [
+        # app / tech
+        "release notes", "app update", "version", "v5.", "new feature", "feature update",
+        "launch", "launches", "launched", "roll out", "rolled out", "rolling out",
+        "new service", "new app", "new platform", "new product", "new tool", "new integration",
+        "ui update", "ux update", "redesign", "in-app", "in app",
+        "group ride", "split fare", "auto-split", "heatmap", "dispatch", "pick-up pin",
+        "in-app chat", "sos button", "real-time tracking", "live tracking", "wallet", 
+        "gcash", "maya", "pay", "payment integration", "ekyc", "onboarding flow",
+        # driver program launches
+        "commission cut", "commission reduction", "commission rate", "lower commission",
+        "incentive program", "incentive launch", "driver reward", "driver app",
+        "driver onboarding", "driver ai", "driver wellness", "driver relief",
+        "fuel subsidy", "fuel relief", "fuel package", "bayanihan fund",
+        "tiered incentive", "driver benefit",
+        # passenger / pricing
+        "fare adjustment", "fare matrix", "surge pricing", "booking fee cap",
+        "group booking", "promo code", "voucher", "discount", "cash loan",
+        # strategic / expansion
+        "superapp", "expansion", "enters", "expands", "new city", "new area", "new market",
+        "partnership", "acquires", "acquisition", "ipo", "going public",
+        # regulatory ops impact (must be direct ops, not just court proceedings)
+        "ltfrb approves", "ltfrb implements", "ltfrb mandates", "ltfrb sets",
+        "dotr approves", "dotr implements", "dotr mandates", "regulatory approval",
+        "franchise granted", "cpc granted", "new regulation", "new policy",
+        "pilot program", "motorcycle taxi pilot", "mc taxi pilot",
+        "tnvs regularization", "tnvs deadline", "booking fee policy", "pick-up rate policy",
+        "fare increase approved", "cap extended", "rider cap", "quota lifted",
     ]
-    return any(s in text for s in core_signals)
+    return any(s in text for s in product_signals)
 
 
 def analyze_ph_item(competitor, source_name, title, raw_text):
-    """Summarize competitor updates in concise English focusing strictly on new features, UI/UX, tech, and policies."""
+    """Summarize only genuine product/feature updates in concise English. 
+    Returns 'SKIP | Noise' for non-product articles so they can be discarded."""
     try:
         prompt = f"""
-        You are an IT Product Owner tracking Ride-Hailing competitors in the Philippines (Grab PH, Move It, Angkas, JoyRide, inDrive, and LTFRB regulations).
-        Analyze the following update regarding '{competitor}' (Source: {source_name}):
+        You are an IT Product Owner at a Ride-Hailing company tracking Philippines competitors (Grab PH, Move It, Angkas, JoyRide, inDrive) and LTFRB regulations.
 
+        Your ONLY job is to track: new features, app releases, product launches, UI/UX changes, pricing/commission changes, driver program launches, and LTFRB regulations that directly change platform operations.
+
+        You DO NOT report on: crimes, harassment incidents, court hearings/fines (unless it changes operations), scholarship stories, general company profiles, static homepage content, sports, entertainment, or social welfare stories.
+
+        Analyze this article about '{competitor}' (Source: {source_name}):
         Title: {title}
-        Content: {raw_text[:3000]}
+        Content: {raw_text[:2500]}
 
-        Return the result on a SINGLE LINE separated by '|':
-        Part 1 (What): A specific, technical/product-oriented summary in ENGLISH (under 45 words) highlighting newly launched features, UI/UX enhancements (e.g. Demand Heatmap, Dispatch Modal, Pick-up Pins, Group Ride, in-app chat), driver onboarding/eKYC flows (Professional License, NBI Clearance, vehicle inspection), wallet/payment integrations (GCash, Maya), rating/auto-forgiveness mechanics, pricing/commission/surge algorithms, or LTFRB/DOTr regulatory mandates. If the article is general news, distill only the direct operational or product impact.
-        Part 2 (Side): Exactly one of: Driver / Passenger / Both / Marketplace / Regulatory
+        IF this article describes a new product feature, app update, service launch, pricing/commission change, or operational policy change → return on ONE LINE:
+        [concise ENGLISH summary under 40 words focusing on what changed and what it means for drivers/passengers] | [Driver OR Passenger OR Both OR Regulatory]
+
+        IF this article is NOT about a product/feature/policy change (e.g. crime, harassment, general news profile, court case, scholarship, static page) → return exactly:
+        SKIP | Noise
         """
         res = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
+            temperature=0.0
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
@@ -355,8 +394,30 @@ def job_collect_ph_data():
     display_date = now.strftime("%d %b %Y")
     new_rows = []
 
+def _parse_ai_output(ai_out):
+    """Parse AI output. Returns (what_text, side_label, is_skip)."""
+    parts = [p.strip() for p in ai_out.split("|")]
+    what_text  = parts[0] if len(parts) > 0 else ai_out
+    side_label = parts[1] if len(parts) > 1 else "Marketplace"
+    # AI returns "SKIP | Noise" for non-product articles
+    is_skip = what_text.upper() == "SKIP" or side_label.lower() == "noise"
+    return what_text, side_label, is_skip
+
+
+def job_collect_ph_data():
+    """Luồng 1 (2 ngày/lần): Quét báo chí chính thống PH, Brand Portals, Grab Press, Play Store & App Store."""
+    print(f"[{datetime.now()}] Starting 48h PH Market Data Scan...")
+    raw_sheet, _, _ = init_sheets()
+    existing_urls = set(raw_sheet.col_values(8))
+
+    now = datetime.now()
+    iso_date = now.strftime("%Y-%m-%d")
+    display_date = now.strftime("%d %b %Y")
+    new_rows = []
+    skipped = 0
+
     # 1. Quét báo chí chính thống uy tín Philippines (BusinessWorld, Philstar, Rappler, GMA, Inquirer)
-    print("-> 1/6: Đang quét các nguồn báo chí uy tín Philippines (BusinessWorld, Philstar, Rappler, GMA, Inquirer)...")
+    print("-> 1/6: Scanning reputable PH media (BusinessWorld, Philstar, Rappler, GMA, Inquirer)...")
     for item in PH_REPUTABLE_MEDIA_SOURCES:
         source_label = item["source"]
         rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(item['query'])}&hl=en-PH&gl=PH&ceid=PH:en"
@@ -371,14 +432,16 @@ def job_collect_ph_data():
             text_to_analyze = content if (content and len(content) > 150) else entry.get("summary", clean_title)
             comp = detect_competitor(clean_title, text_to_analyze)
             ai_out = analyze_ph_item(comp, source_label, clean_title, text_to_analyze)
-            parts = [p.strip() for p in ai_out.split("|")]
-            what_text = parts[0] if len(parts) > 0 else ai_out
-            side_label = parts[1] if len(parts) > 1 else "Marketplace"
+            what_text, side_label, is_skip = _parse_ai_output(ai_out)
+            if is_skip:
+                skipped += 1
+                existing_urls.add(real_url)
+                continue
             new_rows.append([iso_date, display_date, comp, what_text, side_label, source_label, clean_title, real_url])
             existing_urls.add(real_url)
 
     # 2. Quét từ khóa đối thủ & cơ quan quản lý (LTFRB / DOTr)
-    print("-> 2/6: Đang quét từ khóa đối thủ & cơ quan quản lý (LTFRB / DOTr)...")
+    print("-> 2/6: Scanning competitor keywords & LTFRB / DOTr regulatory news...")
     for item in PH_KEYWORD_SOURCES:
         comp = item["competitor"]
         rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(item['query'])}&hl=en-PH&gl=PH&ceid=PH:en"
@@ -393,14 +456,16 @@ def job_collect_ph_data():
             content = trafilatura.extract(downloaded)
             text_to_analyze = content if (content and len(content) > 150) else entry.get("summary", clean_title)
             ai_out = analyze_ph_item(comp, source_name, clean_title, text_to_analyze)
-            parts = [p.strip() for p in ai_out.split("|")]
-            what_text = parts[0] if len(parts) > 0 else ai_out
-            side_label = parts[1] if len(parts) > 1 else "Marketplace"
+            what_text, side_label, is_skip = _parse_ai_output(ai_out)
+            if is_skip:
+                skipped += 1
+                existing_urls.add(real_url)
+                continue
             new_rows.append([iso_date, display_date, comp, what_text, side_label, source_name, clean_title, real_url])
             existing_urls.add(real_url)
 
     # 3. Quét website chính thức của đối thủ (Official Brand Portals)
-    print("-> 3/6: Đang quét trang chính thức của Grab, inDrive, JoyRide, Angkas, Move It...")
+    print("-> 3/6: Scanning official brand portals (Grab, inDrive, JoyRide, Angkas, Move It)...")
     for item in PH_OFFICIAL_BRAND_QUERIES:
         comp = item["competitor"]
         rss_url = f"https://news.google.com/rss/search?q={urllib.parse.quote(item['query'])}&hl=en-PH&gl=PH&ceid=PH:en"
@@ -415,27 +480,31 @@ def job_collect_ph_data():
             content = trafilatura.extract(downloaded)
             text_to_analyze = content if (content and len(content) > 150) else entry.get("summary", clean_title)
             ai_out = analyze_ph_item(comp, source_name, clean_title, text_to_analyze)
-            parts = [p.strip() for p in ai_out.split("|")]
-            what_text = parts[0] if len(parts) > 0 else ai_out
-            side_label = parts[1] if len(parts) > 1 else "Marketplace"
+            what_text, side_label, is_skip = _parse_ai_output(ai_out)
+            if is_skip:
+                skipped += 1
+                existing_urls.add(real_url)
+                continue
             new_rows.append([iso_date, display_date, comp, what_text, side_label, source_name, clean_title, real_url])
             existing_urls.add(real_url)
 
     # 4. Crawl trực tiếp thông cáo báo chí từ Grab Press Centre & Move It
-    print("-> 4/6: Đang crawl trực tiếp Grab Philippines Press Centre & Move It...")
+    print("-> 4/6: Crawling Grab Philippines Press Centre & Move It directly...")
     direct_grab_press = crawl_grab_press_articles(existing_urls)
     for article in direct_grab_press:
         if article["url"] in existing_urls:
             continue
         ai_out = analyze_ph_item(article["competitor"], article["source"], article["title"], article["content"])
-        parts = [p.strip() for p in ai_out.split("|")]
-        what_text = parts[0] if len(parts) > 0 else ai_out
-        side_label = parts[1] if len(parts) > 1 else "Marketplace"
+        what_text, side_label, is_skip = _parse_ai_output(ai_out)
+        if is_skip:
+            skipped += 1
+            existing_urls.add(article["url"])
+            continue
         new_rows.append([iso_date, display_date, article["competitor"], what_text, side_label, article["source"], article["title"], article["url"]])
         existing_urls.add(article["url"])
 
     # 5. Quét Google Play Store Philippines Release Notes (gl='ph')
-    print("-> 5/6: Đang quét Google Play Store Philippines...")
+    print("-> 5/6: Scanning Google Play Store Philippines...")
     for app_cfg in PH_PLAYSTORE_APPS:
         try:
             details = play_app(app_cfg["app_id"], lang='en', country='ph')
@@ -446,32 +515,37 @@ def job_collect_ph_data():
                 continue
             source_title = f"{app_cfg['competitor']} {app_cfg['type']} v{version} Release Notes"
             ai_out = analyze_ph_item(app_cfg["competitor"], "Google Play Store PH", source_title, recent_changes)
-            parts = [p.strip() for p in ai_out.split("|")]
-            what_text = parts[0] if len(parts) > 0 else recent_changes
-            side_label = parts[1] if len(parts) > 1 else ("Driver" if "Driver" in app_cfg["type"] else "Passenger")
+            what_text, side_label, is_skip = _parse_ai_output(ai_out)
+            if is_skip:
+                skipped += 1
+                existing_urls.add(play_url)
+                continue
             new_rows.append([iso_date, display_date, app_cfg["competitor"], what_text, side_label, "Google Play Store PH", source_title, play_url])
             existing_urls.add(play_url)
         except Exception as e:
-            print(f"[PlayStore] Bỏ qua App {app_cfg['app_id']}: {e}")
+            print(f"[PlayStore] Skipped App {app_cfg['app_id']}: {e}")
 
     # 6. Quét Apple App Store Philippines Release Notes (iOS)
-    print("-> 6/6: Đang quét Apple App Store Philippines...")
+    print("-> 6/6: Scanning Apple App Store Philippines...")
     appstore_updates = fetch_appstore_updates(existing_urls)
     for update in appstore_updates:
         if update["url"] in existing_urls:
             continue
         ai_out = analyze_ph_item(update["competitor"], update["source"], update["title"], update["content"])
-        parts = [p.strip() for p in ai_out.split("|")]
-        what_text = parts[0] if len(parts) > 0 else ai_out
-        side_label = parts[1] if len(parts) > 1 else "Marketplace"
+        what_text, side_label, is_skip = _parse_ai_output(ai_out)
+        if is_skip:
+            skipped += 1
+            existing_urls.add(update["url"])
+            continue
         new_rows.append([iso_date, display_date, update["competitor"], what_text, side_label, update["source"], update["title"], update["url"]])
         existing_urls.add(update["url"])
 
+    print(f"Scan complete: {len(new_rows)} product updates accepted, {skipped} non-product articles filtered out.")
     if new_rows:
         raw_sheet.append_rows(new_rows)
-        print(f"Đã ghi {len(new_rows)} dòng mới vào Tab Raw_Data.")
+        print(f"Written {len(new_rows)} new rows to Tab Raw_Data.")
     else:
-        print("Không có tin tức mới nào trong 48 giờ qua.")
+        print("No new product/feature updates found in the past 48 hours.")
         
     send_telegram_2day_digest(new_rows)
 
@@ -506,15 +580,19 @@ def job_generate_ph_biweekly_overview():
     for r in all_records:
         try:
             if datetime.strptime(str(r['Timestamp_ISO']), "%Y-%m-%d") >= cutoff_date:
-                # Prioritize product features, app releases, and transport policy; filter non-product noise
-                if is_product_relevant(str(r.get('Source_Title', '')), str(r.get('What', '')), str(r.get('Who', ''))):
+                title = str(r.get('Source_Title', ''))
+                what  = str(r.get('What', ''))
+                who   = str(r.get('Who', ''))
+                # Apply strict product-only filter
+                if is_product_relevant(title, what, who):
                     if not is_duplicate(r, filtered_rows):
-                        # Ensure accurate Side classification
-                        if r.get('Side') in [None, '', 'Marketplace']:
-                            r['Side'] = guess_side(str(r.get('What', '')) + " " + str(r.get('Source_Title', '')))
+                        # Re-classify Side using keyword logic (more accurate than raw collect side)
+                        r['Side'] = guess_side(what + " " + title + " " + who)
                         filtered_rows.append(r)
         except ValueError:
             continue
+
+    print(f"Filtered {len(filtered_rows)} product-relevant records (from {len(all_records)} total in sheet).")
 
     if not filtered_rows:
         print("No feature updates recorded in the past 14 days. Generating 'No Updates' report...")
