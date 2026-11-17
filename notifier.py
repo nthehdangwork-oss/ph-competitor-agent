@@ -11,9 +11,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 SHEET_URL = os.getenv("SHEET_URL", "#")
 
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")
-RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
-EMAIL_PASSWORD = os.getenv("EMAIL_APP_PASSWORD")
+SENDER_EMAIL = (os.getenv("SENDER_EMAIL") or "").strip()
+RECEIVER_EMAIL = (os.getenv("RECEIVER_EMAIL") or "").strip()
+EMAIL_PASSWORD = (os.getenv("EMAIL_APP_PASSWORD") or "").replace(" ", "").strip()
 
 
 def send_telegram_2day_digest(new_rows):
