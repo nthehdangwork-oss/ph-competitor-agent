@@ -83,8 +83,9 @@ def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action
     """
     Send an HTML-formatted executive email report styled after Google Docs (Date | Who | What | Side | Ref).
     """
-    if not (SENDER_EMAIL and RECEIVER_EMAIL and EMAIL_PASSWORD):
-        print("[Notifier] Skipped Email notification: SENDER_EMAIL / EMAIL_APP_PASSWORD not configured.")
+    receiver_list = [r.strip() for r in RECEIVER_EMAIL.split(",") if r.strip()]
+    if not (SENDER_EMAIL and receiver_list and EMAIL_PASSWORD):
+        print("[Notifier] Skipped Email notification: SENDER_EMAIL / RECEIVER_EMAIL / EMAIL_APP_PASSWORD not configured.")
         return
 
     table_rows_html = ""
@@ -153,7 +154,7 @@ def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"[PH Competitor Product Report] {report_header}"
     msg["From"] = SENDER_EMAIL
-    msg["To"] = RECEIVER_EMAIL
+    msg["To"] = ", ".join(receiver_list)
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
@@ -161,13 +162,13 @@ def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action
             server = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
             server.starttls()
             server.login(SENDER_EMAIL, EMAIL_PASSWORD)
-            server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+            server.sendmail(SENDER_EMAIL, receiver_list, msg.as_string())
             server.quit()
-            print(f"[Notifier] Successfully delivered email report to {RECEIVER_EMAIL} via TLS:587!")
+            print(f"[Notifier] Successfully delivered email report to {', '.join(receiver_list)} via TLS:587!")
         except Exception:
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
                 server.login(SENDER_EMAIL, EMAIL_PASSWORD)
-                server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
-            print(f"[Notifier] Successfully delivered email report to {RECEIVER_EMAIL} via SSL:465!")
+                server.sendmail(SENDER_EMAIL, receiver_list, msg.as_string())
+            print(f"[Notifier] Successfully delivered email report to {', '.join(receiver_list)} via SSL:465!")
     except Exception as e:
         print(f"[Notifier] Email delivery failed (will retry automatically on GitHub Actions): {e}")

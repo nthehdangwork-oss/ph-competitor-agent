@@ -11,19 +11,21 @@ SENDER_EMAIL = os.getenv("SENDER_EMAIL", "").strip()
 RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL", "").strip()
 EMAIL_PASSWORD = os.getenv("EMAIL_APP_PASSWORD", "").strip().replace(" ", "")
 
-print("=== PH COMPETITOR AGENT: EMAIL TEST SCRIPT ===")
-print(f"Sender Email  : {SENDER_EMAIL}")
-print(f"Receiver Email: {RECEIVER_EMAIL}")
-print(f"Password set  : {'Yes (' + str(len(EMAIL_PASSWORD)) + ' chars)' if EMAIL_PASSWORD else 'NO'}")
+receiver_list = [r.strip() for r in RECEIVER_EMAIL.split(",") if r.strip()]
 
-if not SENDER_EMAIL or not EMAIL_PASSWORD:
-    print("[ERROR] SENDER_EMAIL hoac EMAIL_APP_PASSWORD chua duoc khai bao trong .env!")
+print("=== PH COMPETITOR AGENT: EMAIL TEST SCRIPT ===")
+print(f"Sender Email    : {SENDER_EMAIL}")
+print(f"Receiver List   : {receiver_list}")
+print(f"Password set    : {'Yes (' + str(len(EMAIL_PASSWORD)) + ' chars)' if EMAIL_PASSWORD else 'NO'}")
+
+if not SENDER_EMAIL or not receiver_list or not EMAIL_PASSWORD:
+    print("[ERROR] SENDER_EMAIL, RECEIVER_EMAIL hoac EMAIL_APP_PASSWORD chua duoc khai bao dung!")
     exit(1)
 
 msg = MIMEMultipart("alternative")
 msg["Subject"] = "[TEST] Test Email Sending Flow - PH Competitor Agent"
 msg["From"] = SENDER_EMAIL
-msg["To"] = RECEIVER_EMAIL
+msg["To"] = ", ".join(receiver_list)
 
 html_content = f"""
 <html>
@@ -36,7 +38,7 @@ html_content = f"""
     <div style="background-color: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 16px; margin: 16px 0;">
         <p style="margin: 0 0 8px 0;"><b>Trang thai:</b> Ket noi SMTP TLS 587 thanh cong</p>
         <p style="margin: 0 0 8px 0;"><b>Sender:</b> {SENDER_EMAIL}</p>
-        <p style="margin: 0;"><b>Receiver:</b> {RECEIVER_EMAIL}</p>
+        <p style="margin: 0;"><b>Receivers:</b> {', '.join(receiver_list)}</p>
     </div>
     <p>He thong bao cao dinh ky 14 ngay se duoc gui vao hom thu nay voi day du bang phan tich tinh nang san pham.</p>
 </body>
@@ -57,9 +59,9 @@ try:
     server.login(SENDER_EMAIL, EMAIL_PASSWORD)
     print("Authentication successful!")
     
-    server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+    server.sendmail(SENDER_EMAIL, receiver_list, msg.as_string())
     server.quit()
-    print(f"\n[SUCCESS] Test email da duoc gui thanh cong toi: {RECEIVER_EMAIL}!")
+    print(f"\n[SUCCESS] Test email da duoc gui thanh cong toi tat ca recipients: {receiver_list}!")
 except smtplib.SMTPAuthenticationError as e:
     print(f"\n[AUTH ERROR] 535 Bad Credentials ({e.smtp_error.decode('utf-8', errors='ignore') if hasattr(e, 'smtp_error') else e})")
     print("Nguyen nhan: Gmail tu choi email hoac mat khau ung dung.")
