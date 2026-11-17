@@ -157,9 +157,17 @@ def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        try:
+            server = smtplib.SMTP("smtp.gmail.com", 587, timeout=15)
+            server.starttls()
             server.login(SENDER_EMAIL, EMAIL_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
-        print(f"[Notifier] Đã gửi email báo cáo thành công tới {RECEIVER_EMAIL}!")
+            server.quit()
+            print(f"[Notifier] Successfully delivered email report to {RECEIVER_EMAIL} via TLS:587!")
+        except Exception:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+                server.login(SENDER_EMAIL, EMAIL_PASSWORD)
+                server.sendmail(SENDER_EMAIL, RECEIVER_EMAIL, msg.as_string())
+            print(f"[Notifier] Successfully delivered email report to {RECEIVER_EMAIL} via SSL:465!")
     except Exception as e:
-        print(f"[Notifier] Gửi email báo cáo thất bại (sẽ tự động gửi lại trên GitHub Actions): {e}")
+        print(f"[Notifier] Email delivery failed (will retry automatically on GitHub Actions): {e}")

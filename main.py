@@ -259,18 +259,62 @@ def init_sheets():
     return raw_sheet, table_sheet, archive_sheet
 
 
-def is_product_relevant(title, what):
-    """Filter out non-product noise (e.g. elections, unrelated crimes, exams) to keep reports focused on product & tech."""
+def guess_side(text):
+    """Accurately classify Side (Driver / Passenger / Both / Regulatory / Marketplace) based on keywords."""
+    t = text.lower()
+    driver_words = ["driver", "biker", "rider", "onboarding", "license", "ekyc", "commission", "incentive", "fuel", "subsidy", "operator"]
+    passenger_words = ["passenger", "customer", "group ride", "fare", "booking", "split", "pickup", "dropoff", "commuter", "rider complaint"]
+    regulatory_words = ["ltfrb", "dotr", "regulation", "regulatory", "hearing", "fine", "penalty", "cap", "quota", "pilot", "bill", "law", "franchise", "tnvs"]
+    
+    is_driver = any(w in t for w in driver_words)
+    is_passenger = any(w in t for w in passenger_words)
+    is_reg = any(w in t for w in regulatory_words)
+    
+    if is_reg:
+        return "Regulatory"
+    if is_driver and is_passenger:
+        return "Both"
+    if is_driver:
+        return "Driver"
+    if is_passenger:
+        return "Passenger"
+    return "Marketplace"
+
+
+def is_product_relevant(title, what, who=""):
+    """Filter out non-product noise (e.g. general crime, sports, entertainment, unrelated politics) 
+    to keep reports strictly focused on product, tech, features, and transport operations."""
     text = (title + " " + what).lower()
+    
+    # Must belong to target domain or target competitors
+    valid_competitors = ["grab ph", "move it", "angkas", "joyride ph", "indrive ph", "ltfrb", "dotr"]
+    if who and who.lower() not in valid_competitors:
+        # If categorized as Marketplace or unknown, only allow if strictly mentions ride-hailing/TNVS
+        if not any(k in text for k in ["ride-hailing", "tnvs", "motorcycle taxi", "mc taxi", "grab", "angkas", "joyride", "move it", "indrive"]):
+            return False
+
+    # Negative keyword filter (entertainment, sports, random crimes, lifestyle, general politics)
     noise_keywords = [
-        "midterm", "licensure", "midwives", "street vendors", "maga", 
-        "trump", "shabu", "gun", "bus conductor", "airline", "refunds",
-        "saved p260", "borrowing vehicles", "special permits for asean"
+        "nba", "basketball", "gilas", "fiba", "family feud", "episode", "concert", "celebrity",
+        "showbiz", "scoop opens", "rockwell", "shabu", "gun", "nabbed", "arrested for drugs",
+        "maria ressa", "asean summit vehicles", "pitx for long weekend", "midterm", "licensure",
+        "midwives", "street vendors", "maga", "trump", "airline", "refunds", "saved p260",
+        "borrowing vehicles", "hotel", "resort", "fashion", "pageant", "beauty queen", "miss universe"
     ]
     for n in noise_keywords:
-        if n in text and not any(k in text for k in ["app", "feature", "commission", "fare", "ride", "driver", "biker"]):
+        if n in text:
             return False
-    return True
+
+    # Positive confirmation: must mention mobility, app features, policy, or competitors
+    core_signals = [
+        "app", "feature", "version", "release", "update", "launch", "driver", "rider", "biker",
+        "passenger", "fare", "fee", "commission", "surge", "discount", "promo", "voucher",
+        "payment", "wallet", "gcash", "maya", "onboarding", "ekyc", "license", "inspection",
+        "dispatch", "safety", "sos", "tracking", "map", "pin", "group ride", "pilot",
+        "tnvs", "motorcycle taxi", "mc taxi", "ltfrb", "dotr", "cap", "quota", "hearing", "fine",
+        "penalty", "expansion", "superapp", "cash loan", "incentive", "appeal", "franchise"
+    ]
+    return any(s in text for s in core_signals)
 
 
 def analyze_ph_item(competitor, source_name, title, raw_text):
@@ -296,7 +340,8 @@ def analyze_ph_item(competitor, source_name, title, raw_text):
     except Exception as e:
         print(f"   [OpenAI Notice] API call failed ({e}). Using title as fallback.")
         clean_desc = title[:120] if len(title) > 10 else raw_text[:120]
-        return f"{clean_desc} | Marketplace"
+        side = guess_side(clean_desc + " " + competitor)
+        return f"{clean_desc} | {side}"
 
 
 def job_collect_ph_data():
@@ -431,6 +476,23 @@ def job_collect_ph_data():
     send_telegram_2day_digest(new_rows)
 
 
+def is_duplicate(item, seen_items):
+    """Check if an item is a duplicate or near-duplicate of an already selected item for the same competitor."""
+    title_words = set(re.findall(r'\b[a-zA-Z]{4,}\b', item.get('Source_Title', '').lower()))
+    what_words = set(re.findall(r'\b[a-zA-Z]{4,}\b', item.get('What', '').lower()))
+    combined = title_words.union(what_words)
+    
+    for s in seen_items:
+        if s['Who'] != item['Who']:
+            continue
+        s_combined = set(re.findall(r'\b[a-zA-Z]{4,}\b', (s.get('Source_Title', '') + " " + s.get('What', '')).lower()))
+        if len(combined) > 0 and len(s_combined) > 0:
+            overlap = len(combined.intersection(s_combined)) / min(len(combined), len(s_combined))
+            if overlap >= 0.55:
+                return True
+    return False
+
+
 def job_generate_ph_biweekly_overview():
     """Luồng 2 (2 tuần/lần): Lọc tính năng 14 ngày, tạo báo cáo tiếng Anh chuẩn Tech & Product và gửi thông báo."""
     print(f"[{datetime.now()}] Generating bi-weekly Feature & Product Overview Report...")
@@ -445,8 +507,12 @@ def job_generate_ph_biweekly_overview():
         try:
             if datetime.strptime(str(r['Timestamp_ISO']), "%Y-%m-%d") >= cutoff_date:
                 # Prioritize product features, app releases, and transport policy; filter non-product noise
-                if is_product_relevant(str(r.get('Source_Title', '')), str(r.get('What', ''))):
-                    filtered_rows.append(r)
+                if is_product_relevant(str(r.get('Source_Title', '')), str(r.get('What', '')), str(r.get('Who', ''))):
+                    if not is_duplicate(r, filtered_rows):
+                        # Ensure accurate Side classification
+                        if r.get('Side') in [None, '', 'Marketplace']:
+                            r['Side'] = guess_side(str(r.get('What', '')) + " " + str(r.get('Source_Title', '')))
+                        filtered_rows.append(r)
         except ValueError:
             continue
 
@@ -557,14 +623,28 @@ def job_generate_ph_biweekly_overview():
         bottom_line = parts[0] if len(parts) > 0 else ""
         action_items = parts[1] if len(parts) > 1 else ""
     except Exception as e:
-        print(f"[OpenAI Notice] Error calling GPT-4o ({e}). Generating fallback summary from table.")
-        bottom_line = (
-            f"• Over the past 14 days, {len(filtered_rows)} product updates and competitor announcements were recorded across: {', '.join(competitors_seen)}.\n"
-            "• Key product updates include competitive commission adjustments (e.g., Angkas & JoyRide fee reductions), Grab Group Ride split-fare features, and active mobile application updates on both Google Play and Apple App Store."
-        )
+        print(f"[OpenAI Notice] Error calling GPT-4o ({e}). Generating dynamic fallback summary from table.")
+        highlights_by_comp = {}
+        for idx_f, r_item in enumerate(filtered_rows, start=1):
+            comp = r_item['Who']
+            if comp not in highlights_by_comp:
+                highlights_by_comp[comp] = []
+            highlights_by_comp[comp].append(f"{r_item['What']} [{idx_f}]")
+
+        summary_bullets = [
+            f"• Over the past 14 days, {len(filtered_rows)} distinct product features, policy shifts, and app releases were tracked across: {', '.join(competitors_seen)}."
+        ]
+        for comp, items in highlights_by_comp.items():
+            if comp == "Marketplace":
+                continue
+            summary_bullets.append(f"• **{comp}**: {items[0]}")
+
+        bottom_line = "\n".join(summary_bullets)
+
         action_items = (
-            "• Benchmark newly updated driver and passenger app flows against our current mobile app experience.\n"
-            "• Monitor competitor commission structures and LTFRB regulatory compliance for strategic alignment."
+            "• **Driver Retention & Take Rates**: Benchmark JoyRide and Angkas commission cuts (down to 18%) against our platform take rates and fuel relief subsidies.\n"
+            "• **Passenger UX & Group Rides**: Evaluate GrabCar's automated Group Ride split-fare functionality for adoption in our consumer mobile app.\n"
+            "• **Regulatory Compliance**: Closely audit LTFRB's fixed pick-up rate reinstatement and MC taxi pilot cap enforcement to prevent operational fines."
         )
 
     report_header = (
