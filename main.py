@@ -283,11 +283,14 @@ def guess_side(text):
 
 def is_product_relevant(title, what, who=""):
     """STRICT filter: only retain articles about new features, product launches, app releases,
-    UI/UX changes, pricing/commission changes, driver/passenger program launches, 
+    UI/UX changes, pricing/commission changes, driver/passenger program launches,
     and significant LTFRB policy directly impacting platform operations.
-    Excludes: crime/harassment incidents, court/legal drama, social welfare, general news profiles, 
-    sports, entertainment, static homepage content, and PR fluff."""
+    App Store / Play Store release notes always pass."""
     text = (title + " " + what).lower()
+
+    # ── App Store / Play Store release notes: ALWAYS PASS ─────────────────────
+    if "release notes" in text or ("v5." in text and ("ios" in text or "android" in text or "app" in text)):
+        return True
 
     # ── HARD EXCLUSIONS (always discard) ──────────────────────────────────────────
     hard_noise = [
@@ -349,9 +352,76 @@ def is_product_relevant(title, what, who=""):
     return any(s in text for s in product_signals)
 
 
+def _summarize_release_notes(competitor, version_title, notes_text):
+    """Extract specific feature/fix details from App Store / Play Store release notes.
+    Returns a detailed What string without calling OpenAI (pure rule-based parse + format)."""
+    # Clean up HTML tags and normalize whitespace
+    import re as _re
+    clean = _re.sub(r'<[^>]+>', '', notes_text).strip()
+    # Split into bullet-like lines
+    lines = [l.strip() for l in _re.split(r'[\n\r•\-–]', clean) if len(l.strip()) > 10]
+    # Keep lines that mention feature/fix/improvement keywords
+    signal_words = [
+        "new", "add", "added", "feature", "improve", "improved", "fix", "fixed", "update", "updated",
+        "enhance", "enhanced", "launch", "introduce", "introduced", "support", "tracking", "book",
+        "ride", "safety", "wallet", "payment", "bug", "performance", "real-time", "real time",
+        "feedback", "receipt", "share", "notification", "alert", "ui", "ux", "experience",
+    ]
+    relevant = [l for l in lines if any(w in l.lower() for w in signal_words)]
+    # Fallback: take first 3 lines if none matched signal words
+    if not relevant:
+        relevant = lines[:3]
+    # For bug-fix-only releases with no specific features, produce a clean note
+    if not relevant or all(len(l) > 200 for l in relevant):
+        summary = "Minor bug fixes and performance improvements; no specific new features listed in this release."
+        side = "Both"
+        prefix = f"v{version} — " if version else ""
+        return f"{prefix}{summary} | {side}"
+    # Format: "v{version}: {bullet1}; {bullet2}; ..."
+    version = version_title.split(" v")[-1].split(" ")[0] if " v" in version_title else ""
+    prefix = f"v{version} — " if version else ""
+    summary = "; ".join(relevant[:4])  # max 4 bullet points
+    if len(summary) > 300:
+        summary = summary[:297] + "..."
+    side = guess_side(notes_text + " " + competitor)
+    return f"{prefix}{summary} | {side}"
+
+
 def analyze_ph_item(competitor, source_name, title, raw_text):
-    """Summarize only genuine product/feature updates in concise English. 
+    """Summarize only genuine product/feature updates in concise English.
+    For App Store / Play Store release notes: extracts exact changelog items.
     Returns 'SKIP | Noise' for non-product articles so they can be discarded."""
+
+    # ── Special path: App Store / Play Store release notes ─────────────────────
+    is_release_note = any(x in title for x in ["Release Notes", "release notes"])
+    if is_release_note and raw_text and len(raw_text) > 10:
+        # Try OpenAI first for richer analysis; fall back to rule-based parser
+        try:
+            prompt = f"""
+You are a mobile product analyst. Extract the key new features, improvements, and bug fixes from the following App Store / Play Store release notes for '{competitor}' app ({title}).
+
+Release Notes:
+{raw_text[:2000]}
+
+Write a clear, specific, technical summary in ENGLISH (max 60 words) that:
+- Lists each distinct new feature or improvement as a short bullet (e.g. "Real-time ride sharing via in-app link; enhanced pick-up pin accuracy; GCash wallet top-up redesigned")
+- Uses technical terms (UI, UX, real-time, eKYC, dispatch, etc.) where appropriate
+- Explicitly mentions WHAT changed (not vague "bug fixes and improvements")
+- If release notes only mention bug fixes with no specifics, state: "Minor bug fixes and performance improvements; no new features listed"
+
+Return ONE line: [your summary] | [Driver OR Passenger OR Both]
+"""
+            res = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0
+            )
+            return res.choices[0].message.content.strip()
+        except Exception:
+            # Rule-based fallback: parse and format the actual release notes text
+            return _summarize_release_notes(competitor, title, raw_text)
+
+    # ── Standard path: news articles, press releases, regulatory updates ───────
     try:
         prompt = f"""
         You are an IT Product Owner at a Ride-Hailing company tracking Philippines competitors (Grab PH, Move It, Angkas, JoyRide, inDrive) and LTFRB regulations.
@@ -382,17 +452,6 @@ def analyze_ph_item(competitor, source_name, title, raw_text):
         side = guess_side(clean_desc + " " + competitor)
         return f"{clean_desc} | {side}"
 
-
-def job_collect_ph_data():
-    """Luồng 1 (2 ngày/lần): Quét báo chí chính thống PH, Brand Portals, Grab Press, Play Store & App Store."""
-    print(f"[{datetime.now()}] Bắt đầu quét dữ liệu thị trường Philippines (Chu kỳ 2 ngày)...")
-    raw_sheet, _, _ = init_sheets()
-    existing_urls = set(raw_sheet.col_values(8))
-
-    now = datetime.now()
-    iso_date = now.strftime("%Y-%m-%d")
-    display_date = now.strftime("%d %b %Y")
-    new_rows = []
 
 def _parse_ai_output(ai_out):
     """Parse AI output. Returns (what_text, side_label, is_skip)."""
