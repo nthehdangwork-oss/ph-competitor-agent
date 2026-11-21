@@ -43,12 +43,16 @@ def send_telegram_2day_digest(new_rows):
         msg = "\n".join(lines)
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    requests.post(url, json={
+    res = requests.post(url, json={
         "chat_id": TELEGRAM_CHAT_ID,
         "text": msg,
         "parse_mode": "Markdown",
         "disable_web_page_preview": True
     })
+    if not res.ok:
+        print(f"[Notifier] Telegram 2-day digest send failed: {res.status_code} - {res.text}")
+    else:
+        print(f"[Notifier] Telegram 2-day digest delivered successfully to {TELEGRAM_CHAT_ID}!")
 
 
 def send_telegram_biweekly_report(report_header, bottom_line, action_items, md_filepath):
@@ -56,6 +60,7 @@ def send_telegram_biweekly_report(report_header, bottom_line, action_items, md_f
     Send the bi-weekly executive overview summary and attach the full Markdown report document via Telegram.
     """
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Notifier] Skipped Telegram bi-weekly report: TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID not configured.")
         return
 
     summary_msg = (
@@ -64,19 +69,27 @@ def send_telegram_biweekly_report(report_header, bottom_line, action_items, md_f
         f"*What I'd Like Us to Act On:*\n{action_items}\n\n"
         f"📎 _Full detailed product report (including Feature Matrix & References) attached below._"
     )
-    requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
+    res_msg = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
         "chat_id": TELEGRAM_CHAT_ID,
         "text": summary_msg,
         "parse_mode": "Markdown"
     })
+    if not res_msg.ok:
+        print(f"[Notifier] Telegram biweekly summary send failed: {res_msg.status_code} - {res_msg.text}")
+    else:
+        print(f"[Notifier] Telegram biweekly summary delivered successfully to {TELEGRAM_CHAT_ID}!")
 
     if os.path.exists(md_filepath):
         with open(md_filepath, "rb") as f:
-            requests.post(
+            res_doc = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
                 data={"chat_id": TELEGRAM_CHAT_ID, "caption": "Detailed Competitor Product Report (Markdown/Doc Format)"},
                 files={"document": f}
             )
+            if not res_doc.ok:
+                print(f"[Notifier] Telegram document upload failed: {res_doc.status_code} - {res_doc.text}")
+            else:
+                print(f"[Notifier] Telegram document delivered successfully to {TELEGRAM_CHAT_ID}!")
 
 
 def send_email_biweekly_report(report_header, bottom_line, filtered_rows, action_items):
