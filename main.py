@@ -24,7 +24,7 @@ from notifier import (
 
 load_dotenv()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 SHEET_NAME = os.getenv("SHEET_NAME", "PH_RideHailing_Competitor_Tracking")
 
 SCOPES = [
@@ -63,7 +63,9 @@ def init_clients():
     gc = gspread.authorize(creds)
     client = OpenAI(
         api_key=GEMINI_API_KEY,
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        max_retries=1,
+        timeout=15.0
     )
 
 # 1. Truy vấn từ khóa theo đối thủ & Cơ quan quản lý (LTFRB / DOTr)
@@ -449,7 +451,7 @@ Return ONE line: [your summary] | [Driver OR Passenger OR Both]
             return res.choices[0].message.content.strip()
         except Exception as e:
             err_str = str(e)
-            if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "API_KEY_INVALID", "400", "401", "403"]):
+            if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "API_KEY_INVALID", "400", "401", "403", "404", "NOT_FOUND"]):
                 if not ai_quota_exhausted:
                     print(f"   [Gemini Notice] API unavailable ({e}). Switching to rule-based filter & parser for remaining items.")
                     ai_quota_exhausted = True
@@ -485,7 +487,7 @@ Return ONE line: [your summary] | [Driver OR Passenger OR Both]
         return res.choices[0].message.content.strip()
     except Exception as e:
         err_str = str(e)
-        if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "API_KEY_INVALID", "400", "401", "403"]):
+        if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "API_KEY_INVALID", "400", "401", "403", "404", "NOT_FOUND"]):
             if not ai_quota_exhausted:
                 print(f"   [Gemini Notice] API unavailable ({e}). Switching to strict rule-based filter for remaining items.")
                 ai_quota_exhausted = True

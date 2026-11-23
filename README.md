@@ -45,7 +45,7 @@ ph-competitor-agent/
    cp .env.example .env
    ```
 4. Điền các thông tin trong file `.env`:
-   - `GEMINI_API_KEY`: API Key Google Gemini (lấy miễn phí tại `https://aistudio.google.com/apikey`) để chạy `gemini-2.5-flash`.
+   - `GEMINI_API_KEY`: API Key Google Gemini (lấy miễn phí tại `https://aistudio.google.com/apikey`) để chạy `gemini-3.5-flash`.
    - `SHEET_NAME` & `SHEET_URL`: Tên và đường link Google Sheets.
    - `TELEGRAM_BOT_TOKEN` & `TELEGRAM_CHAT_ID`: Token bot Telegram và Chat ID nhận tin.
    - `SENDER_EMAIL`, `RECEIVER_EMAIL`, `EMAIL_APP_PASSWORD`: Tài khoản gửi/nhận email báo cáo.
