@@ -23,7 +23,8 @@ from notifier import (
 )
 
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 SHEET_NAME = os.getenv("SHEET_NAME", "PH_RideHailing_Competitor_Tracking")
 
 SCOPES = [
@@ -34,10 +35,11 @@ SHEET_URL = os.getenv("SHEET_URL", "")
 
 gc = None
 client = None
+ai_quota_exhausted = False
 
 
 def init_clients():
-    """Khởi tạo Google Sheets client và OpenAI client khi file cấu hình đã sẵn sàng."""
+    """Khởi tạo Google Sheets client và Google Gemini API client khi file cấu hình đã sẵn sàng."""
     global gc, client
     if gc is not None and client is not None:
         return
@@ -45,8 +47,8 @@ def init_clients():
     errors = []
     if not os.path.exists('service_account.json'):
         errors.append("❌ Thiếu file 'service_account.json' trong thư mục ph-competitor-agent/.")
-    if not OPENAI_API_KEY or "sk-proj-xxxx" in OPENAI_API_KEY:
-        errors.append("❌ Chưa cấu hình OPENAI_API_KEY hợp lệ trong file .env.")
+    if not GEMINI_API_KEY or "AIzaSyXXXX" in GEMINI_API_KEY or "sk-proj-xxxx" in GEMINI_API_KEY:
+        errors.append("❌ Chưa cấu hình GEMINI_API_KEY hợp lệ trong file .env (Lấy miễn phí tại https://aistudio.google.com/apikey).")
 
     if errors:
         print("\n" + "=" * 70)
@@ -59,7 +61,10 @@ def init_clients():
 
     creds = Credentials.from_service_account_file('service_account.json', scopes=SCOPES)
     gc = gspread.authorize(creds)
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client = OpenAI(
+        api_key=GEMINI_API_KEY,
+        base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+    )
 
 # 1. Truy vấn từ khóa theo đối thủ & Cơ quan quản lý (LTFRB / DOTr)
 PH_KEYWORD_SOURCES = [
@@ -262,14 +267,25 @@ def init_sheets():
 def guess_side(text):
     """Accurately classify Side (Driver / Passenger / Both / Regulatory / Marketplace) based on keywords."""
     t = text.lower()
-    driver_words = ["driver", "biker", "rider", "onboarding", "license", "ekyc", "commission", "incentive", "fuel", "subsidy", "operator"]
-    passenger_words = ["passenger", "customer", "group ride", "fare", "booking", "split", "pickup", "dropoff", "commuter", "rider complaint"]
-    regulatory_words = ["ltfrb", "dotr", "regulation", "regulatory", "hearing", "fine", "penalty", "cap", "quota", "pilot", "bill", "law", "franchise", "tnvs"]
-    
-    is_driver = any(w in t for w in driver_words)
-    is_passenger = any(w in t for w in passenger_words)
-    is_reg = any(w in t for w in regulatory_words)
-    
+    driver_words = [
+        r"\bdriver\b", r"\bdrivers\b", r"\bbiker\b", r"\bbikers\b", r"\bonboarding\b",
+        r"\blicense\b", r"\bekyc\b", r"\bcommission\b", r"\bincentive\b", r"\bincentives\b",
+        r"\bfuel\b", r"\bsubsidy\b", r"\boperator\b", r"\bearnings\b"
+    ]
+    passenger_words = [
+        r"\bpassenger\b", r"\bpassengers\b", r"\bcustomer\b", r"\bcustomers\b",
+        r"\bgroup ride\b", r"\bfare\b", r"\bbooking\b", r"\bsplit\b", r"\bpickup\b",
+        r"\bpick-up\b", r"\bdropoff\b", r"\bcommuter\b", r"\bcommuters\b"
+    ]
+    regulatory_words = [
+        r"\bltfrb\b", r"\bdotr\b", r"\bregulation\b", r"\bregulatory\b", r"\bhearing\b",
+        r"\bpenalty\b", r"\bmc taxi pilot\b", r"\bmotorcycle taxi pilot\b", r"\bfranchise\b", r"\btnvs\b"
+    ]
+
+    is_driver = any(re.search(w, t) for w in driver_words)
+    is_passenger = any(re.search(w, t) for w in passenger_words)
+    is_reg = any(re.search(w, t) for w in regulatory_words)
+
     if is_reg:
         return "Regulatory"
     if is_driver and is_passenger:
@@ -357,6 +373,8 @@ def _summarize_release_notes(competitor, version_title, notes_text):
     Returns a detailed What string without calling OpenAI (pure rule-based parse + format)."""
     # Clean up HTML tags and normalize whitespace
     import re as _re
+    version = version_title.split(" v")[-1].split(" ")[0] if " v" in version_title else ""
+    prefix = f"v{version} — " if version else ""
     clean = _re.sub(r'<[^>]+>', '', notes_text).strip()
     # Split into bullet-like lines
     lines = [l.strip() for l in _re.split(r'[\n\r•\-–]', clean) if len(l.strip()) > 10]
@@ -375,27 +393,39 @@ def _summarize_release_notes(competitor, version_title, notes_text):
     if not relevant or all(len(l) > 200 for l in relevant):
         summary = "Minor bug fixes and performance improvements; no specific new features listed in this release."
         side = "Both"
-        prefix = f"v{version} — " if version else ""
         return f"{prefix}{summary} | {side}"
     # Format: "v{version}: {bullet1}; {bullet2}; ..."
-    version = version_title.split(" v")[-1].split(" ")[0] if " v" in version_title else ""
-    prefix = f"v{version} — " if version else ""
-    summary = "; ".join(relevant[:4])  # max 4 bullet points
+    summary = "; ".join(relevant[:4]).replace("|", "-")  # max 4 bullet points
     if len(summary) > 300:
         summary = summary[:297] + "..."
     side = guess_side(notes_text + " " + competitor)
     return f"{prefix}{summary} | {side}"
 
 
+def _fallback_analyze_item(competitor, title, raw_text):
+    """Rule-based fallback when OpenAI API is unavailable or out of quota.
+    Strictly filters out non-product noise and sanitizes text."""
+    if not is_product_relevant(title, raw_text[:600], competitor):
+        return "SKIP | Noise"
+    clean_title = re.sub(r'[\r\n|]+', ' ', title).strip()
+    clean_raw = re.sub(r'[\r\n|]+', ' ', raw_text).strip()
+    clean_desc = clean_title[:160] if len(clean_title) > 15 else clean_raw[:160]
+    side = guess_side(clean_desc + " " + competitor)
+    return f"{clean_desc} | {side}"
+
+
 def analyze_ph_item(competitor, source_name, title, raw_text):
-    """Summarize only genuine product/feature updates in concise English.
+    """Summarize only genuine product/feature updates in concise English using Google Gemini API.
     For App Store / Play Store release notes: extracts exact changelog items.
     Returns 'SKIP | Noise' for non-product articles so they can be discarded."""
+    global ai_quota_exhausted
 
     # ── Special path: App Store / Play Store release notes ─────────────────────
     is_release_note = any(x in title for x in ["Release Notes", "release notes"])
     if is_release_note and raw_text and len(raw_text) > 10:
-        # Try OpenAI first for richer analysis; fall back to rule-based parser
+        if ai_quota_exhausted:
+            return _summarize_release_notes(competitor, title, raw_text)
+        # Try Gemini first for richer analysis; fall back to rule-based parser
         try:
             prompt = f"""
 You are a mobile product analyst. Extract the key new features, improvements, and bug fixes from the following App Store / Play Store release notes for '{competitor}' app ({title}).
@@ -412,16 +442,23 @@ Write a clear, specific, technical summary in ENGLISH (max 60 words) that:
 Return ONE line: [your summary] | [Driver OR Passenger OR Both]
 """
             res = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=GEMINI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.0
             )
             return res.choices[0].message.content.strip()
-        except Exception:
-            # Rule-based fallback: parse and format the actual release notes text
+        except Exception as e:
+            err_str = str(e)
+            if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "API_KEY_INVALID", "400", "401", "403"]):
+                if not ai_quota_exhausted:
+                    print(f"   [Gemini Notice] API unavailable ({e}). Switching to rule-based filter & parser for remaining items.")
+                    ai_quota_exhausted = True
             return _summarize_release_notes(competitor, title, raw_text)
 
     # ── Standard path: news articles, press releases, regulatory updates ───────
+    if ai_quota_exhausted:
+        return _fallback_analyze_item(competitor, title, raw_text)
+
     try:
         prompt = f"""
         You are an IT Product Owner at a Ride-Hailing company tracking Philippines competitors (Grab PH, Move It, Angkas, JoyRide, inDrive) and LTFRB regulations.
@@ -441,16 +478,20 @@ Return ONE line: [your summary] | [Driver OR Passenger OR Both]
         SKIP | Noise
         """
         res = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=GEMINI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0
         )
         return res.choices[0].message.content.strip()
     except Exception as e:
-        print(f"   [OpenAI Notice] API call failed ({e}). Using title as fallback.")
-        clean_desc = title[:120] if len(title) > 10 else raw_text[:120]
-        side = guess_side(clean_desc + " " + competitor)
-        return f"{clean_desc} | {side}"
+        err_str = str(e)
+        if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "API_KEY_INVALID", "400", "401", "403"]):
+            if not ai_quota_exhausted:
+                print(f"   [Gemini Notice] API unavailable ({e}). Switching to strict rule-based filter for remaining items.")
+                ai_quota_exhausted = True
+        else:
+            print(f"   [Gemini Notice] API call failed ({e}). Using rule-based fallback.")
+        return _fallback_analyze_item(competitor, title, raw_text)
 
 
 def _parse_ai_output(ai_out):
@@ -639,9 +680,11 @@ def job_generate_ph_biweekly_overview():
     for r in all_records:
         try:
             if datetime.strptime(str(r['Timestamp_ISO']), "%Y-%m-%d") >= cutoff_date:
-                title = str(r.get('Source_Title', ''))
-                what  = str(r.get('What', ''))
-                who   = str(r.get('Who', ''))
+                title = re.sub(r'[\r\n|]+', ' ', str(r.get('Source_Title', ''))).strip()
+                what  = re.sub(r'[\r\n|]+', ' ', str(r.get('What', ''))).strip()
+                who   = str(r.get('Who', '')).strip()
+                r['Source_Title'] = title
+                r['What'] = what
                 # Apply strict product-only filter
                 if is_product_relevant(title, what, who):
                     if not is_duplicate(r, filtered_rows):
@@ -752,7 +795,7 @@ def job_generate_ph_biweekly_overview():
 
     try:
         res = client.chat.completions.create(
-            model="gpt-4o",
+            model=GEMINI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2
         )
@@ -760,7 +803,7 @@ def job_generate_ph_biweekly_overview():
         bottom_line = parts[0] if len(parts) > 0 else ""
         action_items = parts[1] if len(parts) > 1 else ""
     except Exception as e:
-        print(f"[OpenAI Notice] Error calling GPT-4o ({e}). Generating dynamic fallback summary from table.")
+        print(f"[Gemini Notice] Error calling {GEMINI_MODEL} ({e}). Generating dynamic fallback summary from table.")
         highlights_by_comp = {}
         for idx_f, r_item in enumerate(filtered_rows, start=1):
             comp = r_item['Who']

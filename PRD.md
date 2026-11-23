@@ -8,8 +8,8 @@
 
 | Chu kỳ | Thời gian chạy | Nguồn quét & Xử lý | Đầu ra (Outputs) |
 | :--- | :--- | :--- | :--- |
-| **Luồng 1: Quét dữ liệu (48h/lần)** | 08:00 sáng (2 ngày/lần) | Quét 6 nguồn (Báo chí PH, Từ khóa LTFRB, Website đối thủ, Grab Press, Google Play PH, App Store PH) -> Lọc bỏ tin rác bằng AI (`GPT-4o-mini`) -> Gán nhãn phân hệ (`Driver`, `Passenger`, `Both`, `Regulatory`, `Marketplace`). | 1. Ghi vào **Tab 1 (`Raw_Data`)** trên Google Sheets.<br/>2. Gửi tin nhắn **Telegram Digest 48h**. |
-| **Luồng 2: Báo cáo Tổng hợp (2 tuần/lần)** | 08:30 sáng (Ngày 01 & 15 hàng tháng) | Lấy dữ liệu 14 ngày gần nhất -> Lọc trùng lặp -> Dùng AI (`GPT-4o`) tổng hợp xu hướng, lập bảng tính năng kèm mã trích dẫn `[1], [2]...` và đề xuất hành động cho PO. | 1. Cập nhật **Tab 2** & lưu trữ vào **Tab 3** trên Google Sheets.<br/>2. Xuất **File Báo cáo chuẩn Doc/Markdown**.<br/>3. Gửi **Email HTML** & **Telegram (kèm file)** cho PO. |
+| **Luồng 1: Quét dữ liệu (48h/lần)** | 08:00 sáng (2 ngày/lần) | Quét 6 nguồn (Báo chí PH, Từ khóa LTFRB, Website đối thủ, Grab Press, Google Play PH, App Store PH) -> Lọc bỏ tin rác bằng AI (`Gemini 2.5 Flash`) -> Gán nhãn phân hệ (`Driver`, `Passenger`, `Both`, `Regulatory`, `Marketplace`). | 1. Ghi vào **Tab 1 (`Raw_Data`)** trên Google Sheets.<br/>2. Gửi tin nhắn **Telegram Digest 48h**. |
+| **Luồng 2: Báo cáo Tổng hợp (2 tuần/lần)** | 08:30 sáng (Ngày 01 & 15 hàng tháng) | Lấy dữ liệu 14 ngày gần nhất -> Lọc trùng lặp -> Dùng AI (`Gemini 2.5 Flash`) tổng hợp xu hướng, lập bảng tính năng kèm mã trích dẫn `[1], [2]...` và đề xuất hành động cho PO. | 1. Cập nhật **Tab 2** & lưu trữ vào **Tab 3** trên Google Sheets.<br/>2. Xuất **File Báo cáo chuẩn Doc/Markdown**.<br/>3. Gửi **Email HTML** & **Telegram (kèm file)** cho PO. |
 
 > **Quy tắc khi không có tin mới (No-Update Policy):** Nếu trong 48h hoặc 14 ngày đối thủ không có cập nhật mới, hệ thống **vẫn gửi thông báo xác nhận thị trường ổn định** qua Telegram, Email và ghi log vào Sheet để PO nắm được trạng thái hệ thống.
 

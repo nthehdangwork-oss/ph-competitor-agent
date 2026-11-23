@@ -34,9 +34,9 @@ def send_telegram_2day_digest(new_rows):
     else:
         lines = [f"🇵🇭 *PH COMPETITOR UPDATE ({len(new_rows)} new updates)*\n"]
         for r in new_rows[:10]:
-            comp = r[2]
-            what = r[3]
-            side = r[4]
+            comp = str(r[2]).replace("*", "").replace("_", "").replace("[", "(").replace("]", ")")
+            what = str(r[3]).replace("*", "").replace("_", "").replace("`", "'")
+            side = str(r[4]).replace("*", "").replace("_", "")
             url = r[7]
             lines.append(f"• *[{comp} - {side}]* {what} ([Source]({url}))\n")
         lines.append(f"📊 [Open Google Sheets for details]({SHEET_URL})")
@@ -50,7 +50,16 @@ def send_telegram_2day_digest(new_rows):
         "disable_web_page_preview": True
     })
     if not res.ok:
-        print(f"[Notifier] Telegram 2-day digest send failed: {res.status_code} - {res.text}")
+        # Fallback to plain text if Telegram Markdown parser rejects special characters in URL/text
+        res_plain = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg.replace("*", ""),
+            "disable_web_page_preview": True
+        })
+        if not res_plain.ok:
+            print(f"[Notifier] Telegram 2-day digest send failed: {res.status_code} - {res.text}")
+        else:
+            print(f"[Notifier] Telegram 2-day digest delivered (plain text fallback) to {TELEGRAM_CHAT_ID}!")
     else:
         print(f"[Notifier] Telegram 2-day digest delivered successfully to {TELEGRAM_CHAT_ID}!")
 
@@ -75,7 +84,14 @@ def send_telegram_biweekly_report(report_header, bottom_line, action_items, md_f
         "parse_mode": "Markdown"
     })
     if not res_msg.ok:
-        print(f"[Notifier] Telegram biweekly summary send failed: {res_msg.status_code} - {res_msg.text}")
+        res_plain = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage", json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": summary_msg.replace("*", "").replace("_", "")
+        })
+        if not res_plain.ok:
+            print(f"[Notifier] Telegram biweekly summary send failed: {res_msg.status_code} - {res_msg.text}")
+        else:
+            print(f"[Notifier] Telegram biweekly summary delivered (plain text fallback) to {TELEGRAM_CHAT_ID}!")
     else:
         print(f"[Notifier] Telegram biweekly summary delivered successfully to {TELEGRAM_CHAT_ID}!")
 
