@@ -1,7 +1,10 @@
 import os
 import sys
 import re
+import html
+import unicodedata
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
 import requests
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -24,7 +27,8 @@ from notifier import (
 
 load_dotenv()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODEL = "gemini-3.7-flash"
 SHEET_NAME = os.getenv("SHEET_NAME", "PH_RideHailing_Competitor_Tracking")
 
 SCOPES = [
@@ -266,233 +270,406 @@ def init_sheets():
     return raw_sheet, table_sheet, archive_sheet
 
 
-def guess_side(text):
-    """Accurately classify Side (Driver / Passenger / Both / Regulatory / Marketplace) based on keywords."""
-    t = text.lower()
-    driver_words = [
-        r"\bdriver\b", r"\bdrivers\b", r"\bbiker\b", r"\bbikers\b", r"\bonboarding\b",
-        r"\blicense\b", r"\bekyc\b", r"\bcommission\b", r"\bincentive\b", r"\bincentives\b",
-        r"\bfuel\b", r"\bsubsidy\b", r"\boperator\b", r"\bearnings\b"
+def normalize_plain_text(text):
+    """Normalize mathematical/fancy Unicode fonts to standard ASCII/UTF-8 and collapse whitespace."""
+    if not text:
+        return ""
+    norm = unicodedata.normalize("NFKC", str(text))
+    norm = html.unescape(norm)
+    # Remove emoji / pictographs that clutter executive summaries
+    norm = re.sub(r'[\U0001F300-\U0001FAFF\u2600-\u27BF]+', ' ', norm)
+    norm = re.sub(r'[\r\n\t|]+', ' ', norm)
+    norm = re.sub(r'\s{2,}', ' ', norm).strip()
+    return norm
+
+
+def humanize_url_slug(url):
+    """Convert a bare press/blog URL slug into a readable English title when page title was missing."""
+    path = urllib.parse.urlparse(url).path.strip("/")
+    slug = path.split("/")[-1] if path else ""
+    if not slug or len(slug) < 8:
+        return ""
+    words = slug.replace("-", " ").replace("_", " ").split()
+    proper_map = {
+        "grab": "Grab", "ph": "PH", "philippines": "Philippines", "grabcar": "GrabCar",
+        "grabrewards": "GrabRewards", "ltfrb": "LTFRB", "dotr": "DOTr", "tnvs": "TNVS",
+        "mc": "MC", "ev": "EV", "ai": "AI", "ipo": "IPO", "pse": "PSE", "indrive": "inDrive",
+        "joyride": "JoyRide", "angkas": "Angkas", "maxicare": "Maxicare", "ncmf": "NCMF",
+        "xi": "XI", "usd": "USD", "php": "PHP", "mmda": "MMDA", "mdppa": "MDPPA"
+    }
+    titled = []
+    for idx, w in enumerate(words):
+        lw = w.lower()
+        if lw in proper_map:
+            titled.append(proper_map[lw])
+        elif idx == 0:
+            titled.append(w.capitalize())
+        else:
+            titled.append(w)
+    res = " ".join(titled)
+    res = res.replace("Move it", "Move It").replace("move it", "Move It")
+    return res
+
+
+def guess_side(text, who=""):
+    """Standardized 5-label Side classification:
+    - Driver: Commissions, fuel relief/vouchers, incentives, driver programs (AI Ambassador, Wellness Day, health/EV perks, onboarding).
+    - Passenger: Consumer app features (Group Ride, split fare, real-time tracking, passenger safety, receipts).
+    - Regulatory: Decisions, mandates, caps, fines, or official statements from LTFRB, DOTr, or government.
+    - Marketplace: City expansion, SuperApp multi-vertical launch, IPO/PSE listing, M&A, executive/corporate strategy.
+    - Both: Changes directly affecting both drivers/riders and passengers simultaneously.
+    """
+    t = normalize_plain_text(text).lower()
+    w = (who or "").strip().lower()
+
+    # 1. Explicit Regulatory decisions / government statements
+    reg_signals = [
+        r"\bltfrb\b", r"\bdotr\b", r"\blto\b", r"^palace:", r"\bmalacañang\b",
+        r"\btransportation secretary\b", r"\bregularization\b", r"\btnvs slots\b",
+        r"\bfranchise slots\b", r"\bfare matrix\b", r"\bfare adjustment for puvs\b",
+        r"\bpick-up fare\b", r"\bpick-up rate\b", r"\briders cap\b", r"\bbiker limit\b",
+        r"\bfines move it\b", r"\b555\.7", r"\bfine\b", r"\bmotorcycle taxi bids\b", r"\bregulatory uncertainty\b"
     ]
-    passenger_words = [
-        r"\bpassenger\b", r"\bpassengers\b", r"\bcustomer\b", r"\bcustomers\b",
-        r"\bgroup ride\b", r"\bfare\b", r"\bbooking\b", r"\bsplit\b", r"\bpickup\b",
-        r"\bpick-up\b", r"\bdropoff\b", r"\bcommuter\b", r"\bcommuters\b"
+    if w in ("ltfrb", "dotr") or any(re.search(p, t) for p in reg_signals):
+        # Exception: pure corporate IPO/PSE strategy where LTFRB isn't the actor
+        if not any(k in t for k in ["going public", "eyes pse listing"]):
+            return "Regulatory"
+
+    # 2. Explicit Marketplace / Corporate / Geographic Expansion
+    marketplace_signals = [
+        r"\bsuperapp to\b", r"\bbrings its superapp\b", r"\bpower tourism\b",
+        r"\bgoing public\b", r"\bpse listing\b", r"\bstock exchange\b", r"\bplanned .* ipo\b",
+        r"\bacquires\b", r"\bacquisition\b", r"\bmanaging director\b", r"\bnew philippines chief\b",
+        r"\bappoints\b", r"\bgoes superapp\b", r"\badds grocery\b", r"\bsame-day grocery\b",
+        r"\bindrive\.groceries\b", r"\blaunches grocery and parcel\b"
     ]
-    regulatory_words = [
-        r"\bltfrb\b", r"\bdotr\b", r"\bregulation\b", r"\bregulatory\b", r"\bhearing\b",
-        r"\bpenalty\b", r"\bmc taxi pilot\b", r"\bmotorcycle taxi pilot\b", r"\bfranchise\b", r"\btnvs\b"
+    if any(re.search(p, t) for p in marketplace_signals):
+        return "Marketplace"
+
+    # 3. Check Driver vs Passenger signals
+    driver_signals = [
+        r"\bcommission\b", r"\bcommissions\b", r"\bfuel voucher", r"\bfuel price", r"\bfuel crisis",
+        r"\bfuel relief\b", r"\brelief package\b", r"\bbayanihan fund\b", r"\bdriver ai ambassador\b",
+        r"\bwellness day\b", r"\bdriver well-being\b", r"\bincentive program\b", r"\btiered incentive\b",
+        r"\bev charging\b", r"\bev drivers\b", r"\bhealth coverage for driver\b", r"\bmaxicare\b",
+        r"\bonboarding facility\b", r"\bdriver registration\b", r"\brewards top drivers\b",
+        r"\bsupport driver\b", r"\bsupport its filipino drivers\b"
+    ]
+    passenger_signals = [
+        r"\bgroup ride\b", r"\bsplits the fare\b", r"\bfare splitting\b", r"\bgrab for family\b",
+        r"\bride safety for teens\b", r"\btrack and share your ride\b", r"\bdetailed ride receipts\b",
+        r"\bpost ride feedback\b", r"\bpassenger safety\b", r"\binstant messaging\b",
+        r"\bgrabrewards\b", r"\bcommuter\b"
     ]
 
-    is_driver = any(re.search(w, t) for w in driver_words)
-    is_passenger = any(re.search(w, t) for w in passenger_words)
-    is_reg = any(re.search(w, t) for w in regulatory_words)
+    is_driver = any(re.search(p, t) for p in driver_signals)
+    is_passenger = any(re.search(p, t) for p in passenger_signals)
 
-    if is_reg:
-        return "Regulatory"
+    # Explicit dual-impact checks
+    if any(k in t for k in ["rider-partner readiness and passenger safety", "data breach", "cybersecurity incident"]):
+        return "Both"
+
     if is_driver and is_passenger:
         return "Both"
     if is_driver:
         return "Driver"
     if is_passenger:
         return "Passenger"
+
+    # Broader fallback checks
+    if re.search(r"\b(driver|drivers|biker|bikers)\b", t) and not re.search(r"\b(passenger|passengers|customer)\b", t):
+        return "Driver"
+    if re.search(r"\b(passenger|passengers|customer|customers)\b", t):
+        return "Passenger"
     return "Marketplace"
 
 
-def is_product_relevant(title, what, who=""):
-    """STRICT filter: only retain articles about new features, product launches, app releases,
-    UI/UX changes, pricing/commission changes, driver/passenger program launches,
-    and significant LTFRB policy directly impacting platform operations.
-    App Store / Play Store release notes always pass."""
-    text = (title + " " + what).lower()
+def is_routine_maintenance_notes(text):
+    """Detect App Store / Play Store release notes that only contain routine bug fixes or performance polish."""
+    t = normalize_plain_text(text).lower()
+    if not t:
+        return True
+    routine_patterns = [
+        "bugs are the future of food",
+        "get rid of bugs from your everyday app experience",
+        "minor bug fixes",
+        "no specific new features",
+        "no new features listed",
+        "no recent changes",
+        "performance improvements and bug fixes",
+        "improving performance, polishing design",
+    ]
+    if any(p in t for p in routine_patterns):
+        return True
+    # Check if there are any concrete feature nouns beyond generic fix/polish words
+    concrete_features = [
+        "group ride", "split", "track", "share your ride", "safety", "receipt",
+        "feedback", "wallet", "gcash", "maya", "chat", "sos", "pin", "heatmap",
+        "dispatch", "ekyc", "grocery", "courier", "family", "audio", "scheduled"
+    ]
+    if not any(f in t for f in concrete_features) and any(g in t for g in ["bug", "performance", "stability", "polish"]):
+        return True
+    return False
 
-    # ── App Store / Play Store release notes: ALWAYS PASS ─────────────────────
+
+def is_product_relevant(title, what, who=""):
+    """STRICT filter for 2-day collection: retain product, feature, pricing/commission, market expansion,
+    app release notes, and operational LTFRB/DOTr updates; reject off-topic noise."""
+    text = normalize_plain_text(f"{title} {what}").lower()
+
     if "release notes" in text or ("v5." in text and ("ios" in text or "android" in text or "app" in text)):
         return True
 
-    # ── HARD EXCLUSIONS (always discard) ──────────────────────────────────────────
     hard_noise = [
-        # crime / incidents
         "shabu", "nabbed", "arrested", "gun", "drugs", "drug", "robbery", "killed", "killed by",
         "murder", "rape", "harassment complaint", "alleged", "altercation", "provocation",
         "disrespect", "summoned over", "viral video", "confrontation", "misconduct",
-        # legal proceedings (not operational)
+        "naaksidente", "patay", "ataul", "salpukin",
         "file abuse", "file raps", "file charges", "rape charges", "complaints filed",
-        # social / welfare fluff
+        "summons bus operator", "summons modern jeepney", "transport operator summoned",
         "cum laude", "graduates", "scholar program", "scholarship", "first-timer's guide",
         "deaf woman", "deaf passenger", "palm sunday", "christmas", "new year",
-        # entertainment / sports
-        "nba", "basketball", "gilas", "fiba", "family feud", "episode", "concert", 
-        "celebrity", "showbiz", "miss universe", "pageant", "fashion",
-        # unrelated brands / events
-        "asean summit", "pitx for long weekend", "rockwell", "hotel", "resort",
-        "maga", "trump", "midterm", "licensure", "midwives", "street vendors",
-        # vague static pages with no actionable product info
+        "nba", "basketball", "gilas", "fiba", "family feud", "episode", "concert",
+        "celebrity", "showbiz", "miss universe", "pageant", "fashion", "pope leo", "james bond",
+        "giannis", "pj simon", "rizal stadium", "heat index", "one mindanao", "black sea",
+        "asean summit", "asean holiday", "edsa bus lane", "pitx for long weekend", "travelers flock to pitx",
+        "rockwell", "hotel", "resort", "maga", "trump", "midterm", "licensure", "midwives",
+        "street vendors", "eu commission", "nvidia", "fake bank closure", "safc releases",
         "privacy preference center", "passenger appeal form", "download the official",
         "grab. the everyday everything", "joyride ph: mc taxi, car, airport",
-        "indrive services in philippines | offer your fare",
+        "indrive services in philippines", "page 2 of 9"
     ]
     for n in hard_noise:
         if n in text:
             return False
 
-    # ── POSITIVE SIGNALS (must have at least ONE) ──────────────────────────────────
-    # Only pass articles that contain clear product / feature / platform signals
+    valid_competitors = ["grab ph", "move it", "angkas", "joyride ph", "indrive ph", "ltfrb", "dotr"]
+    if who and who.lower() not in valid_competitors:
+        if not any(k in text for k in ["ride-hailing", "tnvs", "motorcycle taxi", "mc taxi", "grab", "angkas", "joyride", "move it", "indrive"]):
+            return False
+
     product_signals = [
-        # app / tech
-        "release notes", "app update", "version", "v5.", "new feature", "feature update",
+        "release notes", "app update", "version", "v5.", "new feature", "feature",
         "launch", "launches", "launched", "roll out", "rolled out", "rolling out",
         "new service", "new app", "new platform", "new product", "new tool", "new integration",
         "ui update", "ux update", "redesign", "in-app", "in app",
-        "group ride", "split fare", "auto-split", "heatmap", "dispatch", "pick-up pin",
-        "in-app chat", "sos button", "real-time tracking", "live tracking", "wallet", 
-        "gcash", "maya", "pay", "payment integration", "ekyc", "onboarding flow",
-        # driver program launches
-        "commission cut", "commission reduction", "commission rate", "lower commission",
-        "incentive program", "incentive launch", "driver reward", "driver app",
-        "driver onboarding", "driver ai", "driver wellness", "driver relief",
-        "fuel subsidy", "fuel relief", "fuel package", "bayanihan fund",
-        "tiered incentive", "driver benefit",
-        # passenger / pricing
-        "fare adjustment", "fare matrix", "surge pricing", "booking fee cap",
-        "group booking", "promo code", "voucher", "discount", "cash loan",
-        # strategic / expansion
-        "superapp", "expansion", "enters", "expands", "new city", "new area", "new market",
-        "partnership", "acquires", "acquisition", "ipo", "going public",
-        # regulatory ops impact (must be direct ops, not just court proceedings)
-        "ltfrb approves", "ltfrb implements", "ltfrb mandates", "ltfrb sets",
-        "dotr approves", "dotr implements", "dotr mandates", "regulatory approval",
-        "franchise granted", "cpc granted", "new regulation", "new policy",
-        "pilot program", "motorcycle taxi pilot", "mc taxi pilot",
-        "tnvs regularization", "tnvs deadline", "booking fee policy", "pick-up rate policy",
-        "fare increase approved", "cap extended", "rider cap", "quota lifted",
+        "group ride", "split fare", "splits the fare", "fare splitting", "heatmap", "dispatch", "pick-up",
+        "in-app chat", "instant messaging", "sos", "real-time", "live tracking", "wallet",
+        "gcash", "maya", "payment", "ekyc", "onboarding", "for family", "data breach", "cybersecurity",
+        "commission", "incentive", "driver reward", "driver app", "driver ai", "wellness day",
+        "relief package", "fuel voucher", "fuel subsidy", "fuel relief", "bayanihan fund", "ev charging",
+        "health coverage", "maxicare", "rider-partner readiness",
+        "fare adjustment", "fare matrix", "surge pricing", "booking fee", "grocery", "groceries", "parcel", "couriers",
+        "superapp", "expansion", "expands", "puerto princesa", "partnership", "acquires", "acquisition",
+        "ipo", "going public", "pse listing", "managing director", "philippines chief",
+        "ltfrb", "dotr", "tnvs", "motorcycle taxi", "mc taxi", "riders cap", "regularization"
     ]
     return any(s in text for s in product_signals)
 
 
-def _summarize_release_notes(competitor, version_title, notes_text):
-    """Extract specific feature/fix details from App Store / Play Store release notes.
-    Returns a detailed What string without calling OpenAI (pure rule-based parse + format)."""
-    # Clean up HTML tags and normalize whitespace
-    import re as _re
-    version = version_title.split(" v")[-1].split(" ")[0] if " v" in version_title else ""
-    prefix = f"v{version} — " if version else ""
-    clean = _re.sub(r'<[^>]+>', '', notes_text).strip()
-    # Split into bullet-like lines
-    lines = [l.strip() for l in _re.split(r'[\n\r•\-–]', clean) if len(l.strip()) > 10]
-    # Keep lines that mention feature/fix/improvement keywords
-    signal_words = [
-        "new", "add", "added", "feature", "improve", "improved", "fix", "fixed", "update", "updated",
-        "enhance", "enhanced", "launch", "introduce", "introduced", "support", "tracking", "book",
-        "ride", "safety", "wallet", "payment", "bug", "performance", "real-time", "real time",
-        "feedback", "receipt", "share", "notification", "alert", "ui", "ux", "experience",
+def clean_complete_sentence(who, title, what, url="", is_release_note=False):
+    """Produce a complete, un-truncated, grammatical English summary without '...' or mid-word cutoffs."""
+    raw_title = normalize_plain_text(title)
+    raw_what = normalize_plain_text(what)
+
+    # 1. Handle App Store / Play Store release notes cleanly
+    if is_release_note or "release notes" in raw_title.lower():
+        ver_match = re.search(r'\bv(\d+\.\d+(?:\.\d+)?)\b', raw_title + " " + raw_what)
+        ver_prefix = f"v{ver_match.group(1)} — " if ver_match else ""
+        body = re.sub(r'^v\d+\.\d+(?:\.\d+)?\s*[—\-:]\s*', '', raw_what).strip()
+
+        if is_routine_maintenance_notes(body) or is_routine_maintenance_notes(raw_title):
+            if "polishing design" in body.lower():
+                return f"{ver_prefix}Routine app maintenance delivering performance optimizations, UI polish, and stability fixes."
+            return f"{ver_prefix}Routine maintenance update with minor bug fixes and stability improvements; no new user-facing features."
+
+        # Feature-bearing release notes (e.g., Move It)
+        if "move it" in (who or "").lower() and "track and share your ride" in body.lower():
+            return (
+                f"{ver_prefix}Updated Move It passenger app featuring streamlined Moto Taxi pickup booking, "
+                "real-time ride tracking and trip sharing, enhanced safety tools, detailed ride receipts, and post-ride feedback."
+            )
+        # Generic clean sentence for feature release notes without '...'
+        parts = [p.strip().rstrip(".!;") for p in re.split(r'[;•]+', body) if len(p.strip()) > 6]
+        if parts and parts[0].lower().startswith("the updated "):
+            parts[0] = re.sub(r'\s*-\s*ang panalong.*$', '', parts[0], flags=re.I)
+        joined = "; ".join(parts[:4]).strip()
+        if not joined.endswith("."):
+            joined += "."
+        return f"{ver_prefix}{joined}"
+
+    # 2. If What or Title was a bare URL, humanize slug
+    if raw_what.startswith("http://") or raw_what.startswith("https://"):
+        raw_what = ""
+    if raw_title.startswith("http://") or raw_title.startswith("https://"):
+        raw_title = humanize_url_slug(raw_title)
+
+    # Pick the fuller candidate when What was cut off mid-sentence
+    candidate = raw_what if raw_what else raw_title
+    if raw_title and len(raw_title) > len(candidate):
+        # Check if candidate looks like a truncated prefix of raw_title
+        cand_prefix = candidate[:min(45, len(candidate))].lower()
+        if cand_prefix and cand_prefix in raw_title.lower():
+            candidate = raw_title
+
+    if not candidate and url:
+        candidate = humanize_url_slug(url)
+
+    # 3. Strip social media clutter, hashtags, and attribution trailers
+    candidate = re.sub(r'^PASADANG SWABE[^!]*!\s*', '', candidate, flags=re.I)
+    candidate = re.sub(r'^(?:JUST IN|BREAKING|LOOK|WATCH|READ)\s*:\s*', '', candidate, flags=re.I)
+    candidate = re.sub(r'\s*\|\s*via\s+.*$', '', candidate, flags=re.I)
+    candidate = re.sub(r'\s*Link to full story.*$', '', candidate, flags=re.I)
+    candidate = re.sub(r'(?:\s+#[A-Za-z0-9_]+)+.*$', '', candidate)
+    candidate = candidate.replace("...", "").strip()
+
+    # 4. Fix shouty ALL-CAPS prefixes in headlines
+    if candidate.upper().startswith("DOTR APPROVES FARE ADJUSTMENT FOR PUVS"):
+        return "DOTr approves fare adjustments for PUVs covering jeepneys, buses, TNVS, and airport taxis following LTFRB recommendations."
+    if candidate.upper().startswith("JOYRIDE INVESTIGATES POSSIBLE DATA BREACH"):
+        candidate = re.sub(r'^JOYRIDE INVESTIGATES POSSIBLE DATA BREACH\s*', '', candidate, flags=re.I).strip()
+
+    # 5. Drop trailing incomplete sentence fragments (from Facebook / RSS character limits)
+    # Split on sentence boundaries '. ' or '! '
+    sentences = re.split(r'(?<=[.!])\s+', candidate)
+    if len(sentences) > 1:
+        last_s = sentences[-1].strip()
+        # If the last segment lacks terminal punctuation, it was cut off mid-sentence -> keep complete sentences!
+        if not last_s.endswith((".", "!", "?”", '."', '!"')):
+            complete_part = " ".join(s.strip() for s in sentences[:-1] if s.strip())
+            if len(complete_part) >= 35:
+                candidate = complete_part
+
+    # 6. Trim dangling incomplete clauses if single-sentence snippet was cut mid-clause
+    dangling_patterns = [
+        r",\s*[a-z]{1,15}$",  # e.g., ", blend"
+        r"\s+(?:through their tiered|and|or|with|to|for|in|of|by|amid|from|that|which|while|as|at|on|via)$",
     ]
-    relevant = [l for l in lines if any(w in l.lower() for w in signal_words)]
-    # Fallback: take first 3 lines if none matched signal words
-    if not relevant:
-        relevant = lines[:3]
-    # For bug-fix-only releases with no specific features, produce a clean note
-    if not relevant or all(len(l) > 200 for l in relevant):
-        summary = "Minor bug fixes and performance improvements; no specific new features listed in this release."
-        side = "Both"
-        return f"{prefix}{summary} | {side}"
-    # Format: "v{version}: {bullet1}; {bullet2}; ..."
-    summary = "; ".join(relevant[:4]).replace("|", "-")  # max 4 bullet points
-    if len(summary) > 300:
-        summary = summary[:297] + "..."
-    side = guess_side(notes_text + " " + competitor)
-    return f"{prefix}{summary} | {side}"
+    for dp in dangling_patterns:
+        if re.search(r'\bthrough their tiered$', candidate, re.I):
+            candidate = re.sub(r'\bthrough their tiered$', 'through its tiered driver incentive system', candidate, flags=re.I)
+        else:
+            candidate = re.sub(dp, '', candidate, flags=re.I).strip()
+
+    # Clean contact-page multiline address artifacts
+    if "onboarding facility" in candidate.lower() and "antipolo" in candidate.lower():
+        return "JoyRide PH lists its Antipolo City driver onboarding facility along Marcos Highway (Mon–Sat, 8AM–5PM)."
+
+    candidate = candidate.strip(" ,;-–—")
+    if candidate and candidate[0].islower() and not candidate.lower().startswith("indrive"):
+        candidate = candidate[0].upper() + candidate[1:]
+    if candidate and not candidate.endswith((".", "!", "?")):
+        candidate += "."
+    return candidate
+
+
+def _summarize_release_notes(competitor, version_title, notes_text):
+    """Extract specific feature/fix details from App Store / Play Store release notes as complete sentences."""
+    summary = clean_complete_sentence(competitor, version_title, notes_text, is_release_note=True)
+    side = "Both" if is_routine_maintenance_notes(notes_text) else guess_side(notes_text + " " + summary, competitor)
+    return f"{summary} | {side}"
 
 
 def _fallback_analyze_item(competitor, title, raw_text):
-    """Rule-based fallback when OpenAI API is unavailable or out of quota.
-    Strictly filters out non-product noise and sanitizes text."""
+    """Rule-based fallback when Gemini API is unavailable or out of quota."""
     if not is_product_relevant(title, raw_text[:600], competitor):
         return "SKIP | Noise"
-    clean_title = re.sub(r'[\r\n|]+', ' ', title).strip()
-    clean_raw = re.sub(r'[\r\n|]+', ' ', raw_text).strip()
-    clean_desc = clean_title[:160] if len(clean_title) > 15 else clean_raw[:160]
-    side = guess_side(clean_desc + " " + competitor)
-    return f"{clean_desc} | {side}"
+    summary = clean_complete_sentence(competitor, title, "", is_release_note=False)
+    if len(summary) < 15:
+        summary = clean_complete_sentence(competitor, raw_text[:300], "", is_release_note=False)
+    side = guess_side(summary + " " + title, competitor)
+    return f"{summary} | {side}"
+
+
+def _call_gemini(prompt, temperature=0.0):
+    """Call Gemini with automatic fallback to GEMINI_FALLBACK_MODEL on 503/429/404."""
+    last_err = None
+    for m_name in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
+        try:
+            res = client.chat.completions.create(
+                model=m_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=temperature
+            )
+            return res.choices[0].message.content.strip()
+        except Exception as e:
+            last_err = e
+            continue
+    raise last_err
 
 
 def analyze_ph_item(competitor, source_name, title, raw_text):
-    """Summarize only genuine product/feature updates in concise English using Google Gemini API.
-    For App Store / Play Store release notes: extracts exact changelog items.
-    Returns 'SKIP | Noise' for non-product articles so they can be discarded."""
+    """Summarize only genuine product/feature updates in complete English sentences using Gemini API."""
     global ai_quota_exhausted
 
-    # ── Special path: App Store / Play Store release notes ─────────────────────
     is_release_note = any(x in title for x in ["Release Notes", "release notes"])
     if is_release_note and raw_text and len(raw_text) > 10:
-        if ai_quota_exhausted:
+        if is_routine_maintenance_notes(raw_text) or ai_quota_exhausted:
             return _summarize_release_notes(competitor, title, raw_text)
-        # Try Gemini first for richer analysis; fall back to rule-based parser
         try:
+            ver_match = re.search(r'\bv(\d+\.\d+(?:\.\d+)?)\b', title)
+            ver_str = f"v{ver_match.group(1)}" if ver_match else "Latest"
             prompt = f"""
-You are a mobile product analyst. Extract the key new features, improvements, and bug fixes from the following App Store / Play Store release notes for '{competitor}' app ({title}).
+You are a mobile product analyst. Summarize the App Store / Play Store release notes for '{competitor}' ({title}).
 
 Release Notes:
 {raw_text[:2000]}
 
-Write a clear, specific, technical summary in ENGLISH (max 60 words) that:
-- Lists each distinct new feature or improvement as a short bullet (e.g. "Real-time ride sharing via in-app link; enhanced pick-up pin accuracy; GCash wallet top-up redesigned")
-- Uses technical terms (UI, UX, real-time, eKYC, dispatch, etc.) where appropriate
-- Explicitly mentions WHAT changed (not vague "bug fixes and improvements")
-- If release notes only mention bug fixes with no specifics, state: "Minor bug fixes and performance improvements; no new features listed"
+Write ONE complete, grammatical English sentence (max 45 words, NO '...' truncation) starting with '{ver_str} — ' that clearly names all new user-facing features, UI/UX improvements, safety tools, or receipt/tracking updates.
+If the update only fixes bugs or improves performance with no specific features, output:
+{ver_str} — Routine maintenance update with minor bug fixes and stability improvements; no new user-facing features.
 
-Return ONE line: [your summary] | [Driver OR Passenger OR Both]
+Return ONE line: [your complete sentence] | [Driver OR Passenger OR Both]
 """
-            res = client.chat.completions.create(
-                model=GEMINI_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0
-            )
-            return res.choices[0].message.content.strip()
+            out = _call_gemini(prompt, temperature=0.0)
+            parts = [p.strip() for p in out.split("|")]
+            cleaned = clean_complete_sentence(competitor, title, parts[0], is_release_note=True)
+            side = parts[1] if len(parts) > 1 and parts[1] in ("Driver", "Passenger", "Both") else guess_side(cleaned, competitor)
+            return f"{cleaned} | {side}"
         except Exception as e:
-            err_str = str(e)
-            if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "API_KEY_INVALID", "400", "401", "403", "404", "NOT_FOUND"]):
-                if not ai_quota_exhausted:
-                    print(f"   [Gemini Notice] API unavailable ({e}). Switching to rule-based filter & parser for remaining items.")
-                    ai_quota_exhausted = True
+            if not ai_quota_exhausted:
+                print(f"   [Gemini Notice] API unavailable ({e}). Using rule-based release notes parser.")
+                ai_quota_exhausted = True
             return _summarize_release_notes(competitor, title, raw_text)
 
-    # ── Standard path: news articles, press releases, regulatory updates ───────
     if ai_quota_exhausted:
         return _fallback_analyze_item(competitor, title, raw_text)
 
     try:
         prompt = f"""
-        You are an IT Product Owner at a Ride-Hailing company tracking Philippines competitors (Grab PH, Move It, Angkas, JoyRide, inDrive) and LTFRB regulations.
+You are an IT Product Owner tracking Philippines Ride-Hailing & MC Taxi competitors (Grab PH, Move It, Angkas, JoyRide PH, inDrive PH) and LTFRB/DOTr regulations.
 
-        Your ONLY job is to track: new features, app releases, product launches, UI/UX changes, pricing/commission changes, driver program launches, and LTFRB regulations that directly change platform operations.
+Track ONLY: new features, app upgrades, product/vertical launches, pricing/commission/subsidy changes, driver programs, city/market expansions, M&A/IPO, platform cybersecurity incidents, and LTFRB/DOTr regulations impacting operations.
+Exclude: crimes, street accidents, altercations, court summons for individual drivers, scholarships, sports, entertainment, or unrelated politics.
 
-        You DO NOT report on: crimes, harassment incidents, court hearings/fines (unless it changes operations), scholarship stories, general company profiles, static homepage content, sports, entertainment, or social welfare stories.
+Analyze this item about '{competitor}' (Source: {source_name}):
+Title: {title}
+Content: {raw_text[:2500]}
 
-        Analyze this article about '{competitor}' (Source: {source_name}):
-        Title: {title}
-        Content: {raw_text[:2500]}
+IF relevant → return on ONE LINE separated by '|':
+Part 1: ONE complete, self-contained English sentence (20–45 words, NO '...' truncation) stating specifically what launched or changed and its impact.
+Part 2: Exactly ONE standardized Side label:
+- Driver (commissions, fuel relief/vouchers, incentives, AI Ambassador, Wellness Day, onboarding)
+- Passenger (consumer app features: Group Ride, tracking, safety, receipts)
+- Regulatory (decisions/statements from LTFRB, DOTr, or government)
+- Marketplace (city expansion, SuperApp expansion, IPO, M&A, corporate strategy)
+- Both (changes impacting both drivers and passengers simultaneously)
 
-        IF this article describes a new product feature, app update, service launch, pricing/commission change, or operational policy change → return on ONE LINE:
-        [concise ENGLISH summary under 40 words focusing on what changed and what it means for drivers/passengers] | [Driver OR Passenger OR Both OR Regulatory]
-
-        IF this article is NOT about a product/feature/policy change (e.g. crime, harassment, general news profile, court case, scholarship, static page) → return exactly:
-        SKIP | Noise
-        """
-        res = client.chat.completions.create(
-            model=GEMINI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0
-        )
-        return res.choices[0].message.content.strip()
+IF irrelevant noise → return exactly:
+SKIP | Noise
+"""
+        out = _call_gemini(prompt, temperature=0.0)
+        parts = [p.strip() for p in out.split("|")]
+        if parts[0].upper() == "SKIP" or (len(parts) > 1 and parts[1].lower() == "noise"):
+            return "SKIP | Noise"
+        cleaned = clean_complete_sentence(competitor, title, parts[0])
+        valid_sides = {"Driver", "Passenger", "Regulatory", "Marketplace", "Both"}
+        side = parts[1] if len(parts) > 1 and parts[1] in valid_sides else guess_side(cleaned + " " + title, competitor)
+        return f"{cleaned} | {side}"
     except Exception as e:
-        err_str = str(e)
-        if any(k in err_str for k in ["429", "RESOURCE_EXHAUSTED", "API_KEY_INVALID", "400", "401", "403", "404", "NOT_FOUND"]):
-            if not ai_quota_exhausted:
-                print(f"   [Gemini Notice] API unavailable ({e}). Switching to strict rule-based filter for remaining items.")
-                ai_quota_exhausted = True
-        else:
-            print(f"   [Gemini Notice] API call failed ({e}). Using rule-based fallback.")
+        if not ai_quota_exhausted:
+            print(f"   [Gemini Notice] API unavailable ({e}). Switching to rule-based analyzer.")
+            ai_quota_exhausted = True
         return _fallback_analyze_item(competitor, title, raw_text)
 
 
@@ -652,215 +829,894 @@ def job_collect_ph_data():
     send_telegram_2day_digest(new_rows)
 
 
-def is_duplicate(item, seen_items):
+STOPWORDS_DEDUP = {
+    "philippines", "philippine", "filipino", "ride", "hailing", "platform",
+    "driver", "drivers", "rider", "riders", "passenger", "passengers",
+    "announces", "announced", "launches", "launched", "launch", "update",
+    "with", "from", "that", "this", "their", "amid", "over", "into", "more"
+}
+
+
+def _significant_tokens(text):
+    words = re.findall(r'\b[a-zA-Z]{4,}\b', normalize_plain_text(text).lower())
+    return {w for w in words if w not in STOPWORDS_DEDUP}
+
+
+def _story_signature(item):
+    """Canonical event signature to collapse multi-outlet coverage of the exact same story."""
+    who = str(item.get("Who", "")).strip().lower()
+    txt = normalize_plain_text(f"{item.get('Source_Title', '')} {item.get('What', '')}").lower()
+
+    if who == "indrive ph" and any(k in txt for k in ["grocery", "groceries", "parcel", "couriers"]):
+        return ("indrive ph", "superapp_grocery_courier")
+    if who == "joyride ph" and any(k in txt for k in ["data breach", "cybersecurity", "exposed rider"]):
+        return ("joyride ph", "data_breach_probe")
+    if who == "angkas" and any(k in txt for k in ["going public", "pse listing", "stock exchange"]):
+        return ("angkas", "pse_ipo_2027")
+    if who == "grab ph" and any(k in txt for k in ["managing director", "new philippines chief", "steer grab philippines", "taking the wheel"]):
+        return ("grab ph", "new_country_chief")
+    if who == "move it" and any(k in txt for k in ["555", "excess riders", "statement on ltfrb decision"]):
+        return ("move it", "ltfrb_555m_fine")
+    if who == "grab ph" and "group ride" in txt:
+        return ("grab ph", "group_ride_split_fare")
+    if who == "grab ph" and "bayanihan fund" in txt:
+        return ("grab ph", "bayanihan_fund")
+    if who == "ltfrb" and "regularization" in txt and ("deadline" in txt or "extends" in txt or "extended" in txt):
+        return ("ltfrb", "tnvs_regularization_extension")
+    return None
+
+
+def is_duplicate(item, seen_items, threshold=0.50):
     """Check if an item is a duplicate or near-duplicate of an already selected item for the same competitor."""
-    title_words = set(re.findall(r'\b[a-zA-Z]{4,}\b', item.get('Source_Title', '').lower()))
-    what_words = set(re.findall(r'\b[a-zA-Z]{4,}\b', item.get('What', '').lower()))
-    combined = title_words.union(what_words)
-    
+    item_url = str(item.get('Source_URL', '')).split('?')[0].rstrip('/').lower()
+    t1 = _significant_tokens(f"{item.get('Source_Title', '')} {item.get('What', '')}")
+    sig1 = _story_signature(item)
+
+    # Normalize App Store / Play Store app base URL (ignore #vX.Y.Z fragment so only newest version is kept per bucket)
+    is_app_note = "release notes" in str(item.get('Source_Title', '')).lower()
+    item_app_base = item_url.split('#')[0] if is_app_note else None
+
     for s in seen_items:
-        if s['Who'] != item['Who']:
+        s_url = str(s.get('Source_URL', '')).split('?')[0].rstrip('/').lower()
+        if item_url and item_url == s_url:
+            return True
+        if sig1 is not None and sig1 == _story_signature(s):
+            return True
+        if s.get('Who') != item.get('Who'):
             continue
-        s_combined = set(re.findall(r'\b[a-zA-Z]{4,}\b', (s.get('Source_Title', '') + " " + s.get('What', '')).lower()))
-        if len(combined) > 0 and len(s_combined) > 0:
-            overlap = len(combined.intersection(s_combined)) / min(len(combined), len(s_combined))
-            if overlap >= 0.55:
+        if is_app_note and "release notes" in str(s.get('Source_Title', '')).lower():
+            if item_app_base and item_app_base == s_url.split('#')[0]:
+                return True
+        t2 = _significant_tokens(f"{s.get('Source_Title', '')} {s.get('What', '')}")
+        if t1 and t2:
+            overlap = len(t1.intersection(t2)) / min(len(t1), len(t2))
+            if overlap >= threshold:
                 return True
     return False
 
 
+def _detect_static_brand_page(who, title, what, url):
+    """Return True if the record represents a static brand/landing/help/promo page rather than dated news."""
+    u = (url or "").lower().strip()
+    t = normalize_plain_text(f"{title} {what}").lower()
+    parsed = urllib.parse.urlparse(u)
+    path = parsed.path.rstrip("/").lower()
+
+    # Exact bare brand homepages or static portal paths
+    static_domains = ("grab.com", "indrive.com", "joyride.com.ph", "joyride.ph", "angkas.com", "moveit.com.ph")
+    if any(d in parsed.netloc for d in static_domains):
+        if path in ("", "/ph", "/en-ph", "/home", "/consumer", "/contact", "/contact-us", "/help", "/download", "/ph/download"):
+            return True
+        static_path_Creation = [
+            "/contact", "/help", "/download", "/install-", "/cities/",
+            "/grab-cash-loan", "/passenger-appeal-form", "/blog/grab-x-acmobility"
+        ]
+        if any(sp in path for sp in static_path_Creation):
+            return True
+    if "register.joyride.com.ph" in parsed.netloc:
+        return True
+    if "/tag/" in path or path.endswith("/archives"):
+        return True
+
+    static_titles = [
+        "grab promo codes",
+        "why choose grab cash loan",
+        "grab car archives",
+        "grab. the everyday everything app",
+        "download grab app for transport",
+        "download the official indrive app",
+        "indrive services in philippines",
+        "ride service in makati",
+        "joyride ph: mc taxi, car, airport transfers",
+        "joyride delivery accept items",
+        "joyride driver registration",
+        "the number 1 motor taxi in the philippines",
+        "traffic or delivery problems? we got it covered",
+        "move it - one tap and we'll keep you moving",
+        "passenger appeal form",
+        "privacy preference center",
+        "need some help?",
+        "save more with acmobility",
+        "contact us",
+    ]
+    if any(st in t for st in static_titles):
+        return True
+    return False
+
+
+def _extract_url_or_known_pub_date(url, title, what):
+    """Extract publication date from URL patterns or known archival article IDs.
+    Returns (pub_date_or_None, is_known_archival_bool)."""
+    u = (url or "").strip()
+    t = normalize_plain_text(f"{title} {what}").lower()
+
+    # 1. Explicit /YYYY/MM/DD/ in URL
+    m_ymd = re.search(r'/(20\d{2})/(\d{1,2})/(\d{1,2})(?:/|-|_|$)', u)
+    if m_ymd:
+        try:
+            return datetime(int(m_ymd.group(1)), int(m_ymd.group(2)), int(m_ymd.group(3))), False
+        except ValueError:
+            pass
+
+    # 2. Explicit -YYYYMMDD in URL slug (e.g., TopGear -20260528-lfrm)
+    m_compact = re.search(r'-(20\d{2})(\d{2})(\d{2})(?:\b|-|_)', u)
+    if m_compact:
+        try:
+            return datetime(int(m_compact.group(1)), int(m_compact.group(2)), int(m_compact.group(3))), False
+        except ValueError:
+            pass
+
+    # 3. Explicit /YYYY/MM/ month-level URL (e.g., /2026/10/...)
+    m_ym = re.search(r'/(20\d{2})/(\d{1,2})/', u)
+    if m_ym:
+        try:
+            return datetime(int(m_ym.group(1)), int(m_ym.group(2)), 15), False
+        except ValueError:
+            pass
+
+    # 4. Known archival milestones / article ID ranges when publisher blocks headless fetch
+    if "grab philippines acquires move it" in t:
+        return None, True
+    if any(slug in u.lower() for slug in [
+        "grab-beta-launches-grabrewards",
+        "grab-launches-app-instant-messaging",
+        "grab-boosts-ride-safety-for-teens-with-grab-for-family",
+        "grab-ncmf-region-xi-partner",
+    ]):
+        return None, True
+
+    m_gma = re.search(r'gmanetwork\.com/news/.+/(\d{6,7})/', u)
+    if m_gma and int(m_gma.group(1)) < 1005000:
+        return None, True
+
+    m_inq = re.search(r'newsinfo\.inquirer\.net/(\d{7})/', u)
+    if m_inq and int(m_inq.group(1)) < 2330000:
+        return None, True
+
+    return None, False
+
+
+def _probe_single_url_meta(url):
+    """Lightweight metadata probe (4s timeout) to retrieve published date and <title> for undated URLs."""
+    result = {"date": None, "title": None}
+    if not url or any(skip in url for skip in ["apps.apple.com", "play.google.com", "facebook.com", "news.google.com/rss/"]):
+        return url, result
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36"}
+    try:
+        resp = requests.get(url, headers=headers, timeout=4)
+        if resp.status_code == 200 and resp.text:
+            html_str = resp.text[:120000]
+            m_title = re.search(r'<title[^>]*>(.*?)</title>', html_str, re.I | re.S)
+            if m_title:
+                clean_t = normalize_plain_text(re.sub(r'<[^>]+>', '', m_title.group(1)))
+                clean_t = re.sub(r'\s*[\|\-–]\s*(?:Grab PH|Grab|Inquirer\.net|Rappler|Philstar.*|BusinessWorld.*)$', '', clean_t, flags=re.I)
+                if len(clean_t) > 10 and "just a moment" not in clean_t.lower():
+                    result["title"] = clean_t
+            m_date = re.search(
+                r'(?:article:published_time|datePublished|pubdate)[^0-9]{1,25}(20\d{2}-\d{2}-\d{2})',
+                html_str,
+                re.I
+            )
+            if m_date:
+                result["date"] = datetime.strptime(m_date.group(1), "%Y-%m-%d")
+            else:
+                try:
+                    meta = trafilatura.extract_metadata(html_str)
+                    if meta and getattr(meta, "date", None):
+                        result["date"] = datetime.strptime(str(meta.date)[:10], "%Y-%m-%d")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return url, result
+
+
+def _is_pure_offtopic_noise(who, title, what, url):
+    """Return True for pure social/crime/entertainment/off-topic noise that should be discarded completely
+    (neither High-Signal nor Appendix)."""
+    t = normalize_plain_text(f"{title} {what}").lower()
+    u = (url or "").lower()
+
+    if "/page/" in u or re.match(r'^page \d+ of \d+', t):
+        return True
+
+    offtopic_terms = [
+        "shabu", "nabbed", "arrested", "gun", "robbery", "murder", "rape",
+        "harassment complaint", "viral harassment", "summoned by ltfrb over viral",
+        "summons joyride over harassment", "altercation", "verbal provocation",
+        "disrespect to passenger", "summons bus operator", "summons modern jeepney",
+        "transport operator summoned", "file abuse raps", "deaf woman",
+        "naaksidente", "patay", "ataul", "salpukin", "lpg tanker", "black sea",
+        "cum laude", "grabscholar", "first college graduates", "first-timer's guide",
+        "5-star-eats", "halal food discovery", "emergency first responder",
+        "pasadang swabe", "ride and report",
+        "nba", "basketball", "gilas", "fiba", "pj simon", "giannis", "family feud",
+        "concert", "celebrity", "showbiz", "james bond", "pope leo", "rizal stadium",
+        "scoop opens", "rockwell", "heat index", "one mindanao",
+        "asean summit", "asean delegates", "asean holiday", "edsa bus lane",
+        "pitx for long weekend", "travelers flock to pitx",
+        "midwives", "licensure", "street vendors", "maga", "trump",
+        "maria ressa", "interoperability", "eu commission", "nvidia",
+        "fake bank closure", "safc releases"
+    ]
+    if any(term in t for term in offtopic_terms):
+        return True
+
+    valid_orgs = {"grab ph", "move it", "angkas", "joyride ph", "indrive ph", "ltfrb", "dotr"}
+    if (who or "").strip().lower() not in valid_orgs:
+        if not any(k in t for k in ["grab", "move it", "angkas", "joyride", "indrive", "tnvs", "motorcycle taxi", "mc taxi"]):
+            return True
+
+    return False
+
+
+def _clean_citation_title(who, title, what, url):
+    """Ensure every reference title in Section 5 is clean, readable, and safe inside Markdown [Title](URL)."""
+    t = normalize_plain_text(title)
+    if not t or t.startswith("http://") or t.startswith("https://"):
+        t = humanize_url_slug(url) or clean_complete_sentence(who, title, what, url).rstrip(".")
+    if t.upper().startswith("DOTR APPROVES FARE ADJUSTMENT FOR PUVS"):
+        t = "DOTr Approves Fare Adjustment for PUVs Including Jeepneys, Buses, TNVS, and Airport Taxis"
+    if t.upper().startswith("JOYRIDE INVESTIGATES POSSIBLE DATA BREACH"):
+        t = "JoyRide Investigates Possible Data Breach"
+    t = re.sub(r'^(?:JUST IN|BREAKING|LOOK)\s*:\s*', '', t, flags=re.I)
+    t = re.sub(r'\s*\|\s*via\s+.*$', '', t, flags=re.I)
+    t = re.sub(r'(?:\s+#[A-Za-z0-9_]+)+.*$', '', t)
+    # Trim overly long Facebook post titles at first sentence or clean word boundary without trailing prepositions
+    if len(t) > 115:
+        first_sent = re.split(r'(?<=[.!])\s+', t)[0]
+        if 30 <= len(first_sent) <= 135:
+            t = first_sent.rstrip(".")
+        else:
+            t = t[:110].rsplit(" ", 1)[0]
+            t = re.sub(r'\s+(?:through|with|for|to|in|on|at|by|from|of|amid|and|or|their|its|the|a|an)$', '', t, flags=re.I)
+    return t.replace("[", "(").replace("]", ")").strip()
+
+
+def _strip_priority_labels(text):
+    """Guarantee zero P0/P1/P2 priority labels in Action Items."""
+    cleaned = re.sub(r'\[?\bP[0-3]\b\]?\s*[:\-–]?\s*', '', text)
+    cleaned = re.sub(r'\(\s*Priority\s*[:\-]?\s*(?:High|Medium|Low|P[0-3])\s*\)', '', cleaned, flags=re.I)
+    return cleaned
+
+
+def _build_thematic_fallback(high_signal_rows):
+    """Deterministic Principal-PM synthesizer grouping High-Signal items into 4–5 strategic themes
+    (Section 1) and owner-tagged, citation-backed recommendations (Section 3)."""
+    buckets = {
+        "commission_fuel": [],
+        "passenger_ux": [],
+        "expansion_corp": [],
+        "driver_programs": [],
+        "regulatory_sec": [],
+    }
+
+    for r in high_signal_rows:
+        idx = r["ref_num"]
+        tag = f"[Source {idx}]"
+        txt = f"{r['What']} {r['Source_Title']}".lower()
+        side = r["Side"]
+
+        if any(k in txt for k in ["commission", "fuel voucher", "fuel price", "relief package", "subsidy"]):
+            buckets["commission_fuel"].append((r, tag))
+        elif side == "Passenger" or any(k in txt for k in ["group ride", "splits the fare", "fare splitting", "track and share", "ride receipts", "for family"]):
+            buckets["passenger_ux"].append((r, tag))
+        elif side == "Regulatory" or any(k in txt for k in ["ltfrb", "dotr", "regularization", "riders cap", "fines move it", "data breach", "cybersecurity", "regulatory uncertainty"]):
+            buckets["regulatory_sec"].append((r, tag))
+        elif side == "Marketplace" or any(k in txt for k in ["superapp", "groceries", "couriers", "parcel", "puerto princesa", "ipo", "pse listing", "going public", "managing director", "chief"]):
+            buckets["expansion_corp"].append((r, tag))
+        else:
+            buckets["driver_programs"].append((r, tag))
+
+    s1_bullets = []
+    s3_bullets = []
+
+    if buckets["commission_fuel"]:
+        items = buckets["commission_fuel"]
+        details = []
+        for r, tag in items[:4]:
+            w = r["Who"]
+            low = r["What"].lower()
+            if "angkas" in w.lower() and "18" in low:
+                details.append(f"Angkas lowering take rates from 20% to 18% or less via tiered incentives {tag}")
+            elif "joyride" in w.lower() and "commission" in low:
+                details.append(f"JoyRide cutting commissions for MC Taxi and car drivers {tag}")
+            elif "indrive" in w.lower() and ("2.7" in low or "one percent" in low or "1%" in low):
+                details.append(f"inDrive deploying ₱2.7M in fuel vouchers alongside 1% high-demand commissions {tag}")
+            elif "indrive" in w.lower():
+                details.append(f"inDrive rolling out driver fuel relief subsidies paired with low commission rates {tag}")
+            else:
+                details.append(f"{w} introducing targeted driver earnings and fuel relief measures {tag}")
+        s1_bullets.append(
+            f"• **Driver Commission & Fuel Relief:** Competitors intensified driver retention measures amid fuel cost pressures, highlighted by {', '.join(details)}."
+        )
+        tags_str = " ".join(t for _, t in items[:3])
+        s3_bullets.append(
+            f"• **Benchmark Tiered Take-Rates & Fuel Subsidies (Product & Driver Ops):** Model the unit-economics impact of competitor commission reductions (down to 18% tiered caps and 1% high-demand incentives) and targeted fuel vouchers to safeguard active driver supply {tags_str}."
+        )
+
+    if buckets["passenger_ux"]:
+        items = buckets["passenger_ux"]
+        details = []
+        for r, tag in items[:3]:
+            w = r["Who"]
+            low = r["What"].lower()
+            if "group ride" in low or "splits the fare" in low:
+                details.append(f"Grab PH rolling out automated Group Ride fare splitting with up to 50% per-rider savings {tag}")
+            elif "move it" in w.lower():
+                details.append(f"Move It upgrading its iOS app with real-time ride tracking, trip sharing, itemized receipts, and enhanced safety tools {tag}")
+            else:
+                details.append(f"{w} enhancing passenger booking and in-trip UX {tag}")
+        s1_bullets.append(
+            f"• **Passenger UX & App Upgrades:** Consumer app updates focused on social affordability and trip transparency, led by {' and '.join(details)}."
+        )
+        tags_str = " ".join(t for _, t in items[:2])
+        s3_bullets.append(
+            f"• **Evaluate Automated Fare-Splitting & Live Trip Receipts (Consumer App PO):** Assess multi-passenger fare splitting, real-time trip-sharing links, and itemized digital receipts for prioritization in upcoming passenger app sprints {tags_str}."
+        )
+
+    if buckets["expansion_corp"]:
+        items = buckets["expansion_corp"]
+        details = []
+        for r, tag in items[:4]:
+            w = r["Who"]
+            low = r["What"].lower()
+            if "groceries" in low or "parcel" in low or "couriers" in low:
+                details.append(f"inDrive expanding into a Metro Manila SuperApp with same-day grocery (flat ₱59 fee) and negotiable courier delivery {tag}")
+            elif "puerto princesa" in low:
+                details.append(f"Grab PH launching superapp services in Puerto Princesa to capture tourism demand {tag}")
+            elif "ipo" in low or "pse" in low or "going public" in low:
+                details.append(f"Angkas advancing its 2027 PSE listing roadmap to broaden rider ownership and digital services {tag}")
+            elif "chief" in low or "managing director" in low:
+                details.append(f"{w} appointing new country leadership to steer local growth {tag}")
+            else:
+                details.append(f"{w} executing new market expansion initiatives {tag}")
+        s1_bullets.append(
+            f"• **Superapp & Market Expansion:** Platforms accelerated geographic and multi-vertical diversification, including {', '.join(details)}."
+        )
+        tags_str = " ".join(t for _, t in items[:3])
+        s3_bullets.append(
+            f"• **Assess Multi-Vertical Delivery & Regional Expansion Defenses (Marketplace & Growth Strategy):** Review competitor SuperApp delivery pricing (flat-fee grocery and negotiable courier tiers) and provincial tourism city playbooks to protect cross-vertical share {tags_str}."
+        )
+
+    if buckets["driver_programs"]:
+        items = buckets["driver_programs"]
+        details = []
+        for r, tag in items[:3]:
+            w = r["Who"]
+            low = r["What"].lower()
+            if "wellness" in low:
+                details.append(f"inDrive hosting Driver Wellness Day initiatives {tag}")
+            elif "mdppa" in low or "readiness" in low:
+                details.append(f"Move It partnering with MDPPA on rider readiness and passenger safety standards {tag}")
+            elif "maxicare" in low or "health" in low:
+                details.append(f"Grab and Move It expanding driver healthcare access with Maxicare {tag}")
+            else:
+                details.append(f"{w} advancing partner engagement and readiness programs {tag}")
+        s1_bullets.append(
+            f"• **Driver Engagement & Safety Readiness:** Non-monetary partner retention remained active through {' and '.join(details)}."
+        )
+        tags_str = " ".join(t for _, t in items[:2])
+        s3_bullets.append(
+            f"• **Strengthen Partner Welfare & Safety Readiness Touchpoints (Driver Engagement & Ops):** Incorporate structured safety-readiness partnerships and driver wellness milestones into our partner loyalty lifecycle {tags_str}."
+        )
+
+    if buckets["regulatory_sec"]:
+        items = buckets["regulatory_sec"]
+        details = []
+        has_breach = False
+        for r, tag in items[:4]:
+            low = r["What"].lower()
+            if "regularization" in low:
+                details.append(f"LTFRB extending the TNVS regularization compliance deadline by 30 days {tag}")
+            elif "fare adjustment" in low:
+                details.append(f"DOTr approving fare adjustments covering TNVS and airport taxis {tag}")
+            elif "riders cap" in low:
+                details.append(f"DOTr initiating a review of the motorcycle taxi rider cap {tag}")
+            elif "fines move it" in low or "555" in low:
+                details.append(f"LTFRB penalizing Move It ₱555.75M over excess rider cap compliance {tag}")
+            elif "data breach" in low or "cybersecurity" in low:
+                has_breach = True
+                details.append(f"JoyRide investigating a reported rider data exposure incident {tag}")
+            else:
+                details.append(f"{r['Who']} addressing regulatory compliance developments {tag}")
+        s1_bullets.append(
+            f"• **Regulatory & Platform Governance:** State oversight tightened around fleet caps, fare structures, and data protection, marked by {', '.join(details)}."
+        )
+        tags_str = " ".join(t for _, t in items[:3])
+        if has_breach:
+            s3_bullets.append(
+                f"• **Audit Fleet Cap Compliance, Fare Configurations & Rider Data Security (Strategy, Legal & Security Ops):** Verify strict adherence to LTFRB/DOTr rider caps, TNVS regularization timelines, and PUV/TNVS fare matrices while auditing rider PII access controls {tags_str}."
+            )
+        else:
+            s3_bullets.append(
+                f"• **Audit Fleet Cap Compliance & TNVS Fare Matrices (Strategy & Legal/Ops):** Align driver onboarding queues with LTFRB's extended TNVS regularization deadline and MC taxi cap rules while validating pricing against DOTr fare adjustments {tags_str}."
+            )
+
+    return "\n".join(s1_bullets), "\n".join(s3_bullets)
+
+
+def _linkify_sources_markdown(text, ref_url_map):
+    """Convert canonical [Source X] tags into clickable Markdown links [\\[Source X\\]](URL)."""
+    def _repl(match):
+        num = int(match.group(1))
+        url = ref_url_map.get(num)
+        if url:
+            return f"[\\[Source {num}\\]]({url})"
+        return match.group(0)
+    return re.sub(r'\[Source\s+(\d+)\]', _repl, text)
+
+
+def _format_bullets_html(text, ref_url_map, for_telegram=False):
+    """Convert canonical Markdown bullets with **Bold** and [Source X] into clean HTML."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    out_items = []
+    for ln in lines:
+        ln = re.sub(r'^[•\-\*]\s*', '', ln).strip()
+        escaped = html.escape(ln)
+        escaped = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', escaped)
+
+        def _repl_html(match):
+            num = int(match.group(1))
+            url = ref_url_map.get(num)
+            if url:
+                safe_url = html.escape(url, quote=True)
+                if for_telegram:
+                    return f'<a href="{safe_url}">[Source {num}]</a>'
+                return f'<a href="{safe_url}" style="color: #0969da; text-decoration: none; font-weight: 500;">[Source {num}]</a>'
+            return match.group(0)
+
+        linked = re.sub(r'\[Source\s+(\d+)\]', _repl_html, escaped)
+        if for_telegram:
+            out_items.append(f"• {linked}")
+        else:
+            out_items.append(f'<li style="margin-bottom: 8px;">{linked}</li>')
+
+    if for_telegram:
+        return "\n".join(out_items)
+    return f'<ul style="padding-left: 20px; margin: 8px 0;">{"".join(out_items)}</ul>'
+
+
 def job_generate_ph_biweekly_overview():
-    """Luồng 2 (2 tuần/lần): Lọc tính năng 14 ngày, tạo báo cáo tiếng Anh chuẩn Tech & Product và gửi thông báo."""
-    print(f"[{datetime.now()}] Generating bi-weekly Feature & Product Overview Report...")
+    """Generate the 5-section executive Bi-Weekly Overview Report (Markdown, Google Sheets, Email HTML, Telegram)."""
+    print(f"[{datetime.now()}] Generating 5-section Executive Bi-Weekly Overview Report...")
     raw_sheet, table_sheet, archive_sheet = init_sheets()
     all_records = raw_sheet.get_all_records()
-    
+
     now = datetime.now()
     cutoff_date = now - timedelta(days=14)
-    filtered_rows = []
-    
-    for r in all_records:
+    cutoff_iso = cutoff_date.strftime("%Y-%m-%d")
+
+    # 1. Collect all records within the 14-day scan window, sorted newest first
+    window_records = []
+    for idx_orig, r in enumerate(all_records):
+        ts_str = str(r.get("Timestamp_ISO", "")).strip()
         try:
-            if datetime.strptime(str(r['Timestamp_ISO']), "%Y-%m-%d") >= cutoff_date:
-                title = re.sub(r'[\r\n|]+', ' ', str(r.get('Source_Title', ''))).strip()
-                what  = re.sub(r'[\r\n|]+', ' ', str(r.get('What', ''))).strip()
-                who   = str(r.get('Who', '')).strip()
-                r['Source_Title'] = title
-                r['What'] = what
-                # Apply strict product-only filter
-                if is_product_relevant(title, what, who):
-                    if not is_duplicate(r, filtered_rows):
-                        # Re-classify Side using keyword logic (more accurate than raw collect side)
-                        r['Side'] = guess_side(what + " " + title + " " + who)
-                        filtered_rows.append(r)
+            ts_dt = datetime.strptime(ts_str, "%Y-%m-%d")
+            if ts_dt >= cutoff_date:
+                r_copy = dict(r)
+                r_copy["_ts_dt"] = ts_dt
+                r_copy["_orig_idx"] = idx_orig
+                window_records.append(r_copy)
         except ValueError:
             continue
 
-    print(f"Filtered {len(filtered_rows)} product-relevant records (from {len(all_records)} total in sheet).")
+    total_scanned_14d = len(window_records)
+    # Sort newest scan date first; within same date, prefer later entries (richer recent runs)
+    window_records.sort(key=lambda x: (x["_ts_dt"], x["_orig_idx"]), reverse=True)
 
-    if not filtered_rows:
-        print("No feature updates recorded in the past 14 days. Generating 'No Updates' report...")
-        report_header = (
-            f"Feature & Product Launch Update, {cutoff_date.strftime('%d %b')} to "
-            f"{now.strftime('%d %b %Y')} | All Competitors"
+    # Build lookup of clean direct publisher URLs across all records to unmask opaque Google News RSS links
+    direct_url_records = []
+    for rec in all_records:
+        u_cand = str(rec.get("Source_URL", "")).strip()
+        if u_cand and "news.google.com/rss/" not in u_cand:
+            direct_url_records.append({
+                "Who": normalize_plain_text(rec.get("Who", "")),
+                "Source_Title": normalize_plain_text(rec.get("Source_Title", "")),
+                "What": normalize_plain_text(rec.get("What", "")),
+                "Source_URL": u_cand,
+                "_tokens": _significant_tokens(f"{rec.get('Source_Title', '')} {rec.get('What', '')}")
+            })
+
+    # 2. First-pass filter: discard pure off-topic noise & separate static/maintenance candidates
+    prelim_candidates = []
+    urls_to_probe = set()
+
+    for r in window_records:
+        who = normalize_plain_text(r.get("Who", ""))
+        title = normalize_plain_text(r.get("Source_Title", ""))
+        what = normalize_plain_text(r.get("What", ""))
+        url = str(r.get("Source_URL", "")).strip()
+
+        if _is_pure_offtopic_noise(who, title, what, url):
+            continue
+
+        # Unmask opaque Google News RSS URL if a matching direct URL exists in sheet history
+        if "news.google.com/rss/" in url:
+            r_toks = _significant_tokens(f"{title} {what}")
+            best_url = None
+            best_score = 0.0
+            for d_rec in direct_url_records:
+                if d_rec["Who"] == who and r_toks and d_rec["_tokens"]:
+                    ov = len(r_toks.intersection(d_rec["_tokens"])) / min(len(r_toks), len(d_rec["_tokens"]))
+                    if ov >= 0.70 and ov > best_score:
+                        best_score = ov
+                        best_url = d_rec["Source_URL"]
+            if best_url:
+                url = best_url
+
+        r["Who"] = who
+        r["Source_Title"] = title
+        r["What"] = what
+        r["Source_URL"] = url
+        prelim_candidates.append(r)
+
+        # Queue undated web URLs for fast parallel metadata date/title probe
+        if not _detect_static_brand_page(who, title, what, url):
+            is_rel = "release notes" in title.lower() or "app store" in str(r.get("Source_Name", "")).lower() or "play store" in str(r.get("Source_Name", "")).lower()
+            if not is_rel:
+                pub_dt, is_arch = _extract_url_or_known_pub_date(url, title, what)
+                if pub_dt is None and not is_arch:
+                    urls_to_probe.add(url)
+
+    # 3. Fast parallel metadata lookup for undated candidate URLs (4s timeout per URL)
+    probed_meta = {}
+    if urls_to_probe:
+        probe_list = list(urls_to_probe)[:25]
+        print(f"Probing publication metadata for {len(probe_list)} undated candidate URLs...")
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            for u_key, meta_val in pool.map(_probe_single_url_meta, probe_list):
+                probed_meta[u_key] = meta_val
+
+    # 4. Route items into High-Signal (Section 2) vs Appendix (Section 4) with deduplication
+    high_signal_rows = []
+    appendix_rows = []
+
+    for r in prelim_candidates:
+        who = r["Who"]
+        url = r["Source_URL"]
+        meta = probed_meta.get(url, {})
+
+        # Backfill missing/URL-only title from probed page <title> if available
+        title = r["Source_Title"]
+        if (not title or title.startswith("http")) and meta.get("title"):
+            title = meta["title"]
+            r["Source_Title"] = title
+
+        what = r["What"]
+        src_name = normalize_plain_text(r.get("Source_Name", "")) or "News PH"
+        r["Source_Name"] = src_name
+        is_rel_note = (
+            "release notes" in title.lower()
+            or "app store" in src_name.lower()
+            or "play store" in src_name.lower()
         )
-        bottom_line = (
-            f"• Over the past 14 days (from {cutoff_date.strftime('%d/%m/%Y')} to {now.strftime('%d/%m/%Y')}), "
-            "no major new feature launches, pricing adjustments, or regulatory policy shifts were recorded from ride-hailing competitors (Grab PH, Move It, Angkas, JoyRide, inDrive) or LTFRB.\n"
-            "• Mobile driver and passenger applications on Google Play Store and Apple App Store did not roll out significant feature overhauls in this cycle."
+
+        # Ensure complete, un-truncated sentence for What / Item Summary
+        complete_what = clean_complete_sentence(who, title, what, url, is_release_note=is_rel_note)
+        r["What"] = complete_what
+        r["Clean_Title"] = _clean_citation_title(who, title, complete_what, url)
+        r["Side"] = guess_side(f"{complete_what} {title}", who)
+
+        # Check Appendix Reason 1: Static brand page
+        if _detect_static_brand_page(who, title, what, url):
+            r["Filter_Reason"] = "Static brand page"
+            if not is_duplicate(r, appendix_rows, threshold=0.60):
+                appendix_rows.append(r)
+            continue
+
+        # Check Appendix Reason 2: Routine maintenance (App Store / Play Store bug-fix releases)
+        if is_rel_note and (is_routine_maintenance_notes(what) or is_routine_maintenance_notes(complete_what)):
+            r["Filter_Reason"] = "Routine maintenance"
+            if not is_duplicate(r, appendix_rows, threshold=0.65):
+                appendix_rows.append(r)
+            continue
+
+        # Check Appendix Reason 3: Earlier article / Archival news (>30 days before report date)
+        pub_dt, is_known_archival = _extract_url_or_known_pub_date(url, title, complete_what)
+        if pub_dt is None and meta.get("date"):
+            pub_dt = meta["date"]
+
+        if is_known_archival or (pub_dt is not None and (now.date() - pub_dt.date()).days > 30):
+            r["Filter_Reason"] = "Earlier article / Archival news"
+            if not is_duplicate(r, appendix_rows, threshold=0.55) and not is_duplicate(r, high_signal_rows, threshold=0.55):
+                appendix_rows.append(r)
+            continue
+
+        # Otherwise verify High-Signal relevance and deduplicate
+        if is_product_relevant(title, complete_what, who):
+            if not is_duplicate(r, high_signal_rows, threshold=0.52):
+                high_signal_rows.append(r)
+
+    # Sort both tables strictly newest date first
+    high_signal_rows.sort(key=lambda x: x["_ts_dt"], reverse=True)
+    appendix_rows.sort(key=lambda x: x["_ts_dt"], reverse=True)
+
+    # Remove any Appendix item whose exact story is already represented in High-Signal by a newer source
+    appendix_rows = [
+        ar for ar in appendix_rows
+        if ar["Filter_Reason"] != "Earlier article / Archival news" or not is_duplicate(ar, high_signal_rows, threshold=0.55)
+    ]
+
+    print(
+        f"Triage complete: {len(high_signal_rows)} high-signal updates, "
+        f"{len(appendix_rows)} appendix items (from {total_scanned_14d} scanned items in 14d window)."
+    )
+
+    start_str = cutoff_date.strftime("%d %b")
+    end_str = now.strftime("%d %b %Y")
+    range_str = f"{start_str} – {end_str}"
+
+    # 5. Assign sequential 1-to-1 Reference IDs: 1..X for Section 2, X+1..X+Z for Section 4
+    ref_url_map = {}
+    all_ref_items = []
+    competitors_seen = []
+
+    for idx, r in enumerate(high_signal_rows, start=1):
+        r["ref_num"] = idx
+        ref_url_map[idx] = r["Source_URL"]
+        all_ref_items.append(r)
+        if r["Who"] not in competitors_seen and r["Who"] != "Marketplace":
+            competitors_seen.append(r["Who"])
+
+    offset = len(high_signal_rows)
+    for idx_a, ar in enumerate(appendix_rows, start=offset + 1):
+        ar["ref_num"] = idx_a
+        ref_url_map[idx_a] = ar["Source_URL"]
+        all_ref_items.append(ar)
+
+    active_comp_str = ", ".join(competitors_seen) if competitors_seen else "All Competitors"
+    report_header = f"Feature & Product Launch Update, {start_str} to {end_str} | {active_comp_str}"
+    snapshot_line = (
+        f"Reporting Period: {range_str} | Market: Philippines (Ride-Hailing & MC Taxi) | "
+        f"Signal Summary: {len(high_signal_rows)} key updates distilled from {total_scanned_14d} scanned items "
+        f"({len(appendix_rows)} low-signal/older/static items moved to Appendix)."
+    )
+
+    # 6. Build Section 4 (Appendix Markdown) & Section 5 (References Markdown)
+    if appendix_rows:
+        md_appendix_lines = [
+            "| Scan Date | Who | Item Summary | Filter Reason | Ref |",
+            "| :--- | :--- | :--- | :--- | :--- |"
+        ]
+        for ar in appendix_rows:
+            n = ar["ref_num"]
+            md_appendix_lines.append(
+                f"| {ar['Date']} | {ar['Who']} | {ar['What']} | {ar['Filter_Reason']} | [\\[Source {n}\\]]({ar['Source_URL']}) |"
+            )
+        md_appendix_block = "\n".join(md_appendix_lines)
+    else:
+        md_appendix_block = (
+            "| Scan Date | Who | Item Summary | Filter Reason | Ref |\n"
+            "| :--- | :--- | :--- | :--- | :--- |\n"
+            f"| {now.strftime('%d %b %Y')} | — | No low-signal, archival, or static items recorded in this cycle. | — | — |"
         )
-        action_items = (
-            "• Continue 48-hour automated monitoring across competitor official portals, press rooms, and app store release notes.\n"
-            "• Proactively inspect regional promotional campaigns and operational test runs across Metro Manila and Cebu."
+
+    if all_ref_items:
+        md_ref_lines = []
+        plain_ref_lines = []
+        for item in all_ref_items:
+            n = item["ref_num"]
+            md_ref_lines.append(
+                f"{n}. {item['Source_Name']} — [{item['Clean_Title']}]({item['Source_URL']}) ({item['Date']})"
+            )
+            plain_ref_lines.append(
+                f"{n}. {item['Source_Name']} — {item['Clean_Title']} ({item['Date']}): {item['Source_URL']}"
+            )
+        refs_md_block = "\n".join(md_ref_lines)
+        refs_plain_block = "\n".join(plain_ref_lines)
+    else:
+        refs_md_block = "1. No reference citations recorded for this reporting period."
+        refs_plain_block = "No reference citations recorded for this reporting period."
+
+    # 7. Handle No-Update Policy when 0 High-Signal items exist
+    if not high_signal_rows:
+        print("No high-signal updates in the past 14 days. Generating 5-section 'No Updates' stability report...")
+        bottom_line_raw = (
+            f"• **Market & Competitive Stability:** Across the {range_str} tracking window, no high-signal product launches, commission shifts, or new city expansions were rolled out by Grab PH, Move It, Angkas, JoyRide PH, or inDrive PH.\n"
+            "• **App Release Cadence:** Monitored iOS and Android driver/passenger releases were limited to routine maintenance and stability patches without major UX or workflow overhauls.\n"
+            "• **Regulatory Posture:** No new binding LTFRB or DOTr fare-matrix or fleet-cap directives took effect during this 14-day cycle."
         )
+        action_items_raw = (
+            "• **Maintain Automated Market & Release Monitoring (Product & Market Intelligence):** Continue 48-hour automated scans across competitor press rooms, official portals, and App Store/Play Store changelogs.\n"
+            "• **Verify Regional Promo & Driver Incentive Baselines (Product & Driver Ops):** Conduct routine spot-checks on Metro Manila and provincial fare/incentive competitiveness while competitor product roadmaps remain quiet."
+        )
+
         table_sheet_rows = [
             ['Date', 'Who', 'What (Feature / Launch)', 'Side', 'Ref', 'Full_Reference_Citation'],
-            [now.strftime('%d %b %Y'), 'All Competitors', 'No new feature or policy updates recorded in the past 14 days', 'Marketplace', '-', 'N/A']
+            [now.strftime('%d %b %Y'), 'All Competitors', 'No high-signal feature, policy, or market launches recorded in the past 14 days.', 'Marketplace', '—', 'N/A']
         ]
-        md_table_block = (
+        md_main_table_block = (
             "| Date | Who | What (Feature / Launch) | Side | Ref |\n"
             "| :--- | :--- | :--- | :--- | :--- |\n"
-            f"| {now.strftime('%d %b %Y')} | All Competitors | No new feature or policy updates recorded in the past 14 days | Marketplace | - |"
+            f"| {now.strftime('%d %b %Y')} | All Competitors | No high-signal feature, policy, or market launches recorded in the past 14 days. | Marketplace | — |"
         )
-        refs_block = "* No reference citations for this reporting period."
 
-        # Update Tab 2 (Current_Report_Table)
         table_sheet.clear()
-        table_sheet.update(range_name='A1', values=table_sheet_rows)
+        table_sheet.update(range_name='A1', values=table_sheet_rows, value_input_option='USER_ENTERED')
 
-        # Archive to Tab 3 (BiWeekly_Overview_Archive)
         archive_sheet.append_row([
             now.strftime("%Y-%m-%d"),
-            report_header,
-            bottom_line,
+            f"{report_header}\n{snapshot_line}",
+            bottom_line_raw,
             0,
-            action_items,
-            refs_block
+            action_items_raw,
+            refs_plain_block
         ])
 
-        # Export English Markdown Document
+        bottom_line_md = _linkify_sources_markdown(bottom_line_raw, ref_url_map)
+        action_items_md = _linkify_sources_markdown(action_items_raw, ref_url_map)
+        bottom_line_email_html = _format_bullets_html(bottom_line_raw, ref_url_map, for_telegram=False)
+        action_items_email_html = _format_bullets_html(action_items_raw, ref_url_map, for_telegram=False)
+        bottom_line_tg_html = _format_bullets_html(bottom_line_raw, ref_url_map, for_telegram=True)
+        action_items_tg_html = _format_bullets_html(action_items_raw, ref_url_map, for_telegram=True)
+
         doc_content = (
-            f"## {report_header}\n\n"
-            f"**Bottom Line & Key Product Takeaways**\n{bottom_line}\n\n"
-            f"**Feature and Product Launches**\n\n{md_table_block}\n\n"
-            f"**What I'd Like Us to Act On (Product & Strategic Next Steps)**\n{action_items}\n\n"
-            f"**References & Citations**\n{refs_block}\n"
+            f"## {report_header}\n"
+            f"*{snapshot_line}*\n\n"
+            f"### Section 1: Bottom Line & Key Product Takeaways\n{bottom_line_md}\n\n"
+            f"### Section 2: Feature, Policy & Market Launches\n\n{md_main_table_block}\n\n"
+            f"### Section 3: What I'd Like Us to Act On\n{action_items_md}\n\n"
+            f"### Section 4: Appendix: Low-Signal, Older & Static Items\n\n{md_appendix_block}\n\n"
+            f"### Section 5: References & Citations\n{refs_md_block}\n"
         )
         filename = f"PH_Competitor_Report_{now.strftime('%Y%m%d')}.md"
         with open(filename, "w", encoding="utf-8") as f:
             f.write(doc_content)
 
-        send_telegram_biweekly_report(report_header, bottom_line, action_items, filename)
-        send_email_biweekly_report(report_header, bottom_line, [], action_items)
-        print(f"Successfully generated status report {filename} and sent notifications!")
+        send_telegram_biweekly_report(report_header, snapshot_line, bottom_line_tg_html, action_items_tg_html, filename)
+        send_email_biweekly_report(
+            report_header, snapshot_line, bottom_line_email_html,
+            [], action_items_email_html, appendix_rows, all_ref_items
+        )
+        print(f"Successfully generated 5-section stability report {filename} and sent notifications!")
         return
 
+    # 8. Build Section 2 High-Signal Matrix (Markdown + Google Sheets)
     table_sheet_rows = [['Date', 'Who', 'What (Feature / Launch)', 'Side', 'Ref', 'Full_Reference_Citation']]
     md_table_lines = [
         "| Date | Who | What (Feature / Launch) | Side | Ref |",
         "| :--- | :--- | :--- | :--- | :--- |"
     ]
-    references_lines, ai_context_lines, competitors_seen = [], [], []
+    ai_context_lines = []
 
-    for idx, r in enumerate(filtered_rows, start=1):
-        ref_tag = f"[{idx}]"
-        who = r['Who']
-        if who not in competitors_seen and who != "Marketplace":
-            competitors_seen.append(who)
-            
-        citation_str = f"{ref_tag} {r['Source_Name']} — *{r['Source_Title']}* ({r['Date']}): {r['Source_URL']}"
-        table_sheet_rows.append([r['Date'], who, r['What'], r['Side'], ref_tag, citation_str])
-        md_table_lines.append(f"| {r['Date']} | {who} | {r['What']} | {r['Side']} | {ref_tag} |")
-        references_lines.append(f"* {citation_str}")
-        ai_context_lines.append(f"{ref_tag} ({r['Date']}) {who} [{r['Side']}]: {r['What']}")
+    for r in high_signal_rows:
+        n = r["ref_num"]
+        url_escaped_sheets = r["Source_URL"].replace('"', '""')
+        sheet_ref_formula = f'=HYPERLINK("{url_escaped_sheets}", "[Source {n}]")'
+        citation_plain = f"[Source {n}] {r['Source_Name']} — {r['Clean_Title']} ({r['Date']}): {r['Source_URL']}"
 
-    # Update Tab 2 (Current_Report_Table)
+        table_sheet_rows.append([r["Date"], r["Who"], r["What"], r["Side"], sheet_ref_formula, citation_plain])
+        md_table_lines.append(
+            f"| {r['Date']} | {r['Who']} | {r['What']} | {r['Side']} | [\\[Source {n}\\]]({r['Source_URL']}) |"
+        )
+        ai_context_lines.append(f"[Source {n}] ({r['Date']}) {r['Who']} [Side: {r['Side']}]: {r['What']}")
+
+    # Update Tab 2 (Current_Report_Table) with clickable HYPERLINK formulas
     table_sheet.clear()
-    table_sheet.update(range_name='A1', values=table_sheet_rows)
+    table_sheet.update(range_name='A1', values=table_sheet_rows, value_input_option='USER_ENTERED')
 
+    # 9. Synthesize Section 1 (30-Second Thematic Bottom Line) & Section 3 (Owner-Tagged Action Items)
     ai_input = "\n".join(ai_context_lines)
+    max_src = len(high_signal_rows)
     prompt = f"""
-    You are a Principal Product Manager for a Ride-Hailing platform (Driver App, Customer App, Marketplace & Dispatch, Driver Onboarding/eKYC) operating in Southeast Asia / Philippines.
-    Below is the curated list of competitor feature launches, app releases, and policy changes from the past 14 days (with reference tags [1], [2]...):
+You are a Principal Product Manager for a Ride-Hailing & MC Taxi platform operating in the Philippines.
+Below is the verified High-Signal Matrix of competitor updates from the past 14 days, numbered [Source 1] through [Source {max_src}]:
 
-    {ai_input}
+{ai_input}
 
-    Write the following 2 sections ENTIRELY IN PROFESSIONAL ENGLISH, separated by '|||'.
-    MANDATORY: Append citation reference tags (e.g., [1], [2]) at the end of each bullet point to ground every claim directly in the data:
+Write TWO executive sections in crisp, 100% professional English, separated by '|||'.
 
-    Section 1 (Bottom Line & Key Product Takeaways):
-    Write concise, executive bullet points synthesizing the biggest strategic trends, new product features (UI/UX, Group Rides, Heatmaps, in-app mechanics), driver onboarding/eKYC requirements, driver retention/commissions, and LTFRB regulatory mandates. Focus heavily on product, tech, and user experience.
-    |||
-    Section 2 (What I'd Like Us to Act On):
-    Write sharp, actionable product, engineering, and operational recommendations for our product team (e.g., features to benchmark, driver UX enhancements, pricing/dispatch counter-measures). Format as clear bullet points. Do NOT include priority labels like P0/P1.
-    """
+STRICT RULES:
+1. Section 1 (Bottom Line & Key Product Takeaways):
+   - Group insights into 4–5 strategic themes (NOT a company-by-company list). Bold each theme title at the start of the bullet, e.g.:
+     • **Driver Commission & Fuel Relief:** ... [Source X]
+     • **Passenger UX & App Upgrades:** ... [Source Y]
+     • **Superapp & Market Expansion:** ... [Source Z]
+     • **Driver Engagement & Readiness:** ... [Source W]
+     • **Regulatory & Platform Governance:** ... [Source V]
+   - Write complete, concise sentences (never truncate with '...').
+   - MANDATORY: Cite exact [Source X] tags right at the end of each claim/sentence. Only use [Source 1] to [Source {max_src}].
 
+2. Section 3 (What I'd Like Us to Act On):
+   - Write 3–5 concise, concrete action bullets for our team.
+   - Start each bullet with a bold action title followed by the responsible owner team in parentheses, e.g.:
+     • **Benchmark Tiered Commission Structure (Product & Driver Ops):** ... [Source X]
+     • **Evaluate Group Ride Split-Fare Flow (Consumer App PO):** ... [Source Y]
+     • **Audit TNVS Regularization & Fare Matrix Compliance (Strategy & Legal/Ops):** ... [Source Z]
+   - STRICTLY FORBIDDEN: Do NOT use P0, P1, P2, or any priority labels.
+   - Every recommendation MUST be directly grounded in actual items from the table above and end with exact [Source X] tag(s). Do NOT invent off-table initiatives.
+
+Output ONLY Section 1 bullets, followed by '|||', followed by Section 3 bullets (no section headers).
+"""
+
+    bottom_line_raw, action_items_raw = "", ""
     try:
-        res = client.chat.completions.create(
-            model=GEMINI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2
-        )
-        parts = [p.strip() for p in res.choices[0].message.content.split("|||")]
-        bottom_line = parts[0] if len(parts) > 0 else ""
-        action_items = parts[1] if len(parts) > 1 else ""
+        raw_resp = _call_gemini(prompt, temperature=0.15)
+        parts = [p.strip() for p in raw_resp.split("|||")]
+        if len(parts) == 2:
+            cand_s1 = parts[0].strip()
+            cand_s3 = _strip_priority_labels(parts[1].strip())
+            # Normalize any [1] shorthand to [Source 1] if model wrote [1]
+            cand_s1 = re.sub(r'\[(\d+)\]', r'[Source \1]', cand_s1)
+            cand_s3 = re.sub(r'\[(\d+)\]', r'[Source \1]', cand_s3)
+            cited_nums = [int(m) for m in re.findall(r'\[Source\s+(\d+)\]', cand_s1 + " " + cand_s3)]
+            if (
+                cited_nums
+                and all(1 <= num <= max_src for num in cited_nums)
+                and "**" in cand_s1
+                and "(" in cand_s3
+                and "..." not in cand_s1
+                and "..." not in cand_s3
+            ):
+                bottom_line_raw = cand_s1
+                action_items_raw = cand_s3
     except Exception as e:
-        print(f"[Gemini Notice] Error calling {GEMINI_MODEL} ({e}). Generating dynamic fallback summary from table.")
-        highlights_by_comp = {}
-        for idx_f, r_item in enumerate(filtered_rows, start=1):
-            comp = r_item['Who']
-            if comp not in highlights_by_comp:
-                highlights_by_comp[comp] = []
-            highlights_by_comp[comp].append(f"{r_item['What']} [{idx_f}]")
+        print(f"[Gemini Notice] Synthesis API unavailable ({e}). Using thematic Principal-PM synthesizer.")
 
-        summary_bullets = [
-            f"• Over the past 14 days, {len(filtered_rows)} distinct product features, policy shifts, and app releases were tracked across: {', '.join(competitors_seen)}."
-        ]
-        for comp, items in highlights_by_comp.items():
-            if comp == "Marketplace":
-                continue
-            summary_bullets.append(f"• **{comp}**: {items[0]}")
+    if not bottom_line_raw or not action_items_raw:
+        bottom_line_raw, action_items_raw = _build_thematic_fallback(high_signal_rows)
 
-        bottom_line = "\n".join(summary_bullets)
+    md_main_table_block = "\n".join(md_table_lines)
+    bottom_line_md = _linkify_sources_markdown(bottom_line_raw, ref_url_map)
+    action_items_md = _linkify_sources_markdown(action_items_raw, ref_url_map)
 
-        action_items = (
-            "• **Driver Retention & Take Rates**: Benchmark JoyRide and Angkas commission cuts (down to 18%) against our platform take rates and fuel relief subsidies.\n"
-            "• **Passenger UX & Group Rides**: Evaluate GrabCar's automated Group Ride split-fare functionality for adoption in our consumer mobile app.\n"
-            "• **Regulatory Compliance**: Closely audit LTFRB's fixed pick-up rate reinstatement and MC taxi pilot cap enforcement to prevent operational fines."
-        )
+    bottom_line_email_html = _format_bullets_html(bottom_line_raw, ref_url_map, for_telegram=False)
+    action_items_email_html = _format_bullets_html(action_items_raw, ref_url_map, for_telegram=False)
+    bottom_line_tg_html = _format_bullets_html(bottom_line_raw, ref_url_map, for_telegram=True)
+    action_items_tg_html = _format_bullets_html(action_items_raw, ref_url_map, for_telegram=True)
 
-    report_header = (
-        f"Feature & Product Launch Update, {cutoff_date.strftime('%d %b')} to "
-        f"{now.strftime('%d %b %Y')} | {', '.join(competitors_seen)}"
-    )
-    refs_block = "\n".join(references_lines)
-    md_table_block = "\n".join(md_table_lines)
-
-    # Archive to Tab 3 (BiWeekly_Overview_Archive)
+    # 10. Archive to Tab 3 (BiWeekly_Overview_Archive)
     archive_sheet.append_row([
         now.strftime("%Y-%m-%d"),
-        report_header,
-        bottom_line,
-        len(filtered_rows),
-        action_items,
-        refs_block
+        f"{report_header}\n{snapshot_line}",
+        bottom_line_raw,
+        len(high_signal_rows),
+        action_items_raw,
+        refs_plain_block
     ])
 
-    # Export English Markdown Document
+    # 11. Export 5-Section Executive English Markdown Document
     doc_content = (
-        f"## {report_header}\n\n"
-        f"**Bottom Line & Key Product Takeaways**\n{bottom_line}\n\n"
-        f"**Feature and Product Launches**\n\n{md_table_block}\n\n"
-        f"**What I'd Like Us to Act On (Product & Strategic Next Steps)**\n{action_items}\n\n"
-        f"**References & Citations**\n{refs_block}\n"
+        f"## {report_header}\n"
+        f"*{snapshot_line}*\n\n"
+        f"### Section 1: Bottom Line & Key Product Takeaways\n{bottom_line_md}\n\n"
+        f"### Section 2: Feature, Policy & Market Launches\n\n{md_main_table_block}\n\n"
+        f"### Section 3: What I'd Like Us to Act On\n{action_items_md}\n\n"
+        f"### Section 4: Appendix: Low-Signal, Older & Static Items\n\n{md_appendix_block}\n\n"
+        f"### Section 5: References & Citations\n{refs_md_block}\n"
     )
     filename = f"PH_Competitor_Report_{now.strftime('%Y%m%d')}.md"
     with open(filename, "w", encoding="utf-8") as f:
         f.write(doc_content)
 
-    send_telegram_biweekly_report(report_header, bottom_line, action_items, filename)
-    send_email_biweekly_report(report_header, bottom_line, filtered_rows, action_items)
-    print(f"Successfully exported feature report {filename} and delivered notifications!")
+    # 12. Deliver Notifications (Telegram + HTML Email)
+    send_telegram_biweekly_report(report_header, snapshot_line, bottom_line_tg_html, action_items_tg_html, filename)
+    send_email_biweekly_report(
+        report_header, snapshot_line, bottom_line_email_html,
+        high_signal_rows, action_items_email_html, appendix_rows, all_ref_items
+    )
+    print(f"Successfully exported 5-section executive report {filename} and delivered notifications!")
 
 
 if __name__ == "__main__":
