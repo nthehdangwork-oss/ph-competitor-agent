@@ -849,6 +849,8 @@ def _story_signature(item):
 
     if who == "indrive ph" and any(k in txt for k in ["grocery", "groceries", "parcel", "couriers"]):
         return ("indrive ph", "superapp_grocery_courier")
+    if who == "indrive ph" and any(k in txt for k in ["fuel voucher", "relief package", "surging fuel"]):
+        return ("indrive ph", "fuel_relief_commission")
     if who == "joyride ph" and any(k in txt for k in ["data breach", "cybersecurity", "exposed rider"]):
         return ("joyride ph", "data_breach_probe")
     if who == "angkas" and any(k in txt for k in ["going public", "pse listing", "stock exchange"]):
@@ -1158,22 +1160,29 @@ def _build_thematic_fallback(high_signal_rows):
     if buckets["passenger_ux"]:
         items = buckets["passenger_ux"]
         details = []
+        has_group_ride = False
         for r, tag in items[:3]:
             w = r["Who"]
             low = r["What"].lower()
-            if "group ride" in low or "splits the fare" in low:
+            if "group ride" in low or "splits the fare" in low or "fare splitting" in low:
+                has_group_ride = True
                 details.append(f"Grab PH rolling out automated Group Ride fare splitting with up to 50% per-rider savings {tag}")
             elif "move it" in w.lower():
                 details.append(f"Move It upgrading its iOS app with real-time ride tracking, trip sharing, itemized receipts, and enhanced safety tools {tag}")
             else:
                 details.append(f"{w} enhancing passenger booking and in-trip UX {tag}")
         s1_bullets.append(
-            f"• **Passenger UX & App Upgrades:** Consumer app updates focused on social affordability and trip transparency, led by {' and '.join(details)}."
+            f"- **Passenger UX & App Upgrades:** Consumer app updates focused on trip transparency and in-ride safety, led by {' and '.join(details)}."
         )
         tags_str = " ".join(t for _, t in items[:2])
-        s3_bullets.append(
-            f"• **Evaluate Automated Fare-Splitting & Live Trip Receipts (Consumer App PO):** Assess multi-passenger fare splitting, real-time trip-sharing links, and itemized digital receipts for prioritization in upcoming passenger app sprints {tags_str}."
-        )
+        if has_group_ride:
+            s3_bullets.append(
+                f"- **Evaluate Automated Fare-Splitting & Live Trip Receipts (Consumer App PO):** Assess multi-passenger fare splitting, real-time trip-sharing links, and itemized digital receipts for prioritization in upcoming passenger app sprints {tags_str}."
+            )
+        else:
+            s3_bullets.append(
+                f"- **Benchmark Real-Time Ride Sharing, Safety Tools & Itemized Receipts (Consumer App PO):** Evaluate streamlined pickup booking, live ride-tracking links, enhanced safety controls, and detailed digital receipts for upcoming passenger app sprints {tags_str}."
+            )
 
     if buckets["expansion_corp"]:
         items = buckets["expansion_corp"]
@@ -1238,33 +1247,48 @@ def _build_thematic_fallback(high_signal_rows):
             elif "data breach" in low or "cybersecurity" in low:
                 has_breach = True
                 details.append(f"JoyRide investigating a reported rider data exposure incident {tag}")
+            elif "regulatory uncertainty" in low and "angkas" in low:
+                details.append(f"regulatory headwinds weighing on Angkas's planned PSE IPO {tag}")
+            elif "palace:" in low and "ipo" in low:
+                details.append(f"Malacañang urging rider-partner benefits under Angkas's IPO plan {tag}")
             else:
                 details.append(f"{r['Who']} addressing regulatory compliance developments {tag}")
         s1_bullets.append(
-            f"• **Regulatory & Platform Governance:** State oversight tightened around fleet caps, fare structures, and data protection, marked by {', '.join(details)}."
+            f"- **Regulatory & Platform Governance:** State oversight tightened around fleet caps, fare structures, and data protection, marked by {', '.join(details)}."
         )
-        tags_str = " ".join(t for _, t in items[:3])
+        tags_str = " ".join(t for _, t in items[:4])
         if has_breach:
             s3_bullets.append(
-                f"• **Audit Fleet Cap Compliance, Fare Configurations & Rider Data Security (Strategy, Legal & Security Ops):** Verify strict adherence to LTFRB/DOTr rider caps, TNVS regularization timelines, and PUV/TNVS fare matrices while auditing rider PII access controls {tags_str}."
+                f"- **Audit Fleet Cap Compliance, Fare Matrices & Rider Data Security (Strategy, Legal & Security Ops):** Verify strict adherence to LTFRB/DOTr rider caps and PUV/TNVS fare adjustments while auditing rider PII access controls {tags_str}."
             )
         else:
             s3_bullets.append(
-                f"• **Audit Fleet Cap Compliance & TNVS Fare Matrices (Strategy & Legal/Ops):** Align driver onboarding queues with LTFRB's extended TNVS regularization deadline and MC taxi cap rules while validating pricing against DOTr fare adjustments {tags_str}."
+                f"- **Audit Fleet Cap Compliance & TNVS Fare Matrices (Strategy & Legal/Ops):** Align driver onboarding queues with LTFRB's extended TNVS regularization deadline and MC taxi cap rules while validating pricing against DOTr fare adjustments {tags_str}."
             )
 
     return "\n".join(s1_bullets), "\n".join(s3_bullets)
 
 
 def _linkify_sources_markdown(text, ref_url_map):
-    """Convert canonical [Source X] tags into clickable Markdown links [\\[Source X\\]](URL)."""
+    """Convert canonical bullets to standard Markdown '- ' list items and [Source X] into clickable links."""
+    lines = []
+    for ln in (text or "").splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        s = re.sub(r'^[•\*]\s*', '- ', s)
+        if not s.startswith("- "):
+            s = f"- {s}"
+        lines.append(s)
+    normalized = "\n".join(lines)
+
     def _repl(match):
         num = int(match.group(1))
         url = ref_url_map.get(num)
         if url:
             return f"[\\[Source {num}\\]]({url})"
         return match.group(0)
-    return re.sub(r'\[Source\s+(\d+)\]', _repl, text)
+    return re.sub(r'\[Source\s+(\d+)\]', _repl, normalized)
 
 
 def _format_bullets_html(text, ref_url_map, for_telegram=False):
